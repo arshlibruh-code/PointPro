@@ -10,11 +10,34 @@ import ARKit
 import Metal
 import MetalKit
 import Combine
+import UIKit
 
 class PointCloudEngine: ObservableObject {
     enum PLYExportFormat {
         case binaryLittleEndian
         case ascii
+    }
+
+    enum ExportFormat {
+        case laz
+        case plyBinaryLittleEndian
+        case plyAscii
+        case pdfReport
+    }
+
+    struct ExportArtifact {
+        let primaryURL: URL
+        let sidecarURL: URL?
+        var additionalURLs: [URL] = []
+
+        var shareItems: [URL] {
+            var items: [URL] = [primaryURL]
+            if let sidecarURL {
+                items.append(sidecarURL)
+            }
+            items.append(contentsOf: additionalURLs)
+            return items
+        }
     }
     
     // MARK: - Constants
@@ -43,6 +66,8 @@ class PointCloudEngine: ObservableObject {
     // Texture Caches
     private var cvTextureCache: CVMetalTextureCache?
     private let inFlightSemaphore = DispatchSemaphore(value: 1)
+    private let generationLock = NSLock()
+    private var generationToken: UInt64 = 0
     private var lastProcessedTimestamp: TimeInterval = 0
     private let minProcessInterval: TimeInterval = 1.0 / 15.0
     
@@ -102,6 +127,10 @@ class PointCloudEngine: ObservableObject {
     }
     
     func clearBuffer() {
+        // Invalidate any in-flight frame work so stale callbacks cannot republish points.
+        invalidateGeneration()
+        drainInFlightWork()
+
         let ptr = voxelBuffer.contents()
         memset(ptr, 0, voxelBuffer.length)
         resetCounter()
@@ -132,9 +161,35 @@ class PointCloudEngine: ObservableObject {
         let ptr = counterBuffer.contents().assumingMemoryBound(to: UInt32.self)
         ptr.pointee = UInt32(max(0, count))
     }
+
+    private func invalidateGeneration() {
+        generationLock.lock()
+        generationToken &+= 1
+        generationLock.unlock()
+    }
+
+    private func currentGeneration() -> UInt64 {
+        generationLock.lock()
+        let token = generationToken
+        generationLock.unlock()
+        return token
+    }
+
+    private func isGenerationCurrent(_ token: UInt64) -> Bool {
+        generationLock.lock()
+        let isCurrent = generationToken == token
+        generationLock.unlock()
+        return isCurrent
+    }
+
+    private func drainInFlightWork() {
+        inFlightSemaphore.wait()
+        inFlightSemaphore.signal()
+    }
     
     func processFrame(_ frame: ARFrame) {
         guard isScanning else { return }
+        let generation = currentGeneration()
         guard let depthData = frame.sceneDepth,
               let confidenceMap = depthData.confidenceMap else { return }
         guard frame.timestamp - lastProcessedTimestamp >= minProcessInterval else { return }
@@ -149,6 +204,7 @@ class PointCloudEngine: ObservableObject {
                 inFlightSemaphore.signal()
             }
         }
+        guard isGenerationCurrent(generation) else { return }
         
         // 1. Detect Camera Motion (Apple approach - accumulate when MOVING)
         let currentPosition = SIMD3<Float>(frame.camera.transform.columns.3.x, 
@@ -205,8 +261,10 @@ class PointCloudEngine: ObservableObject {
         commandBuffer.addCompletedHandler { [weak self] _ in
             semaphore.signal()
             guard let self = self else { return }
+            guard self.isGenerationCurrent(generation) else { return }
             let count = self.counterBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee
             DispatchQueue.main.async {
+                guard self.isGenerationCurrent(generation) else { return }
                 self.activePointCount = Int(count)
                 self.currentPointCount = Int(count)
             }
@@ -363,6 +421,2077 @@ class PointCloudEngine: ObservableObject {
         }
         progress?(1.0, "Finalizing export...")
         return url
+    }
+
+    func exportLAZFile(
+        fromSnapshot data: Data,
+        pointCount: Int,
+        suggestedName: String,
+        session: ScanSession,
+        captureMetadata: ScanCaptureMetadata?,
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> ExportArtifact? {
+        if isCancelled?() == true { return nil }
+        progress?(0.0, "Preparing LAZ export...")
+        let safeBase = sanitizeFileName(suggestedName).isEmpty ? "Scan" : sanitizeFileName(suggestedName)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let timestamp = formatter.string(from: Date())
+        let baseName = "\(safeBase)_\(timestamp)"
+
+        let lazURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(baseName).laz")
+        let sidecarURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(baseName).json")
+
+        guard let lazResult = writeLAZ(
+            to: lazURL,
+            fromSnapshot: data,
+            pointCount: pointCount,
+            captureMetadata: captureMetadata,
+            progress: progress,
+            isCancelled: isCancelled
+        ) else {
+            try? FileManager.default.removeItem(at: lazURL)
+            return nil
+        }
+
+        guard writeLAZSidecar(
+            to: sidecarURL,
+            lazURL: lazURL,
+            session: session,
+            captureMetadata: captureMetadata,
+            pointCount: lazResult.pointCount,
+            scale: lazResult.scale,
+            offset: lazResult.offset,
+            boundsMin: lazResult.boundsMin,
+            boundsMax: lazResult.boundsMax,
+            epsg: lazResult.epsg,
+            crsName: lazResult.crsName,
+            georefNote: lazResult.georefNote,
+            headingDegrees: lazResult.headingDegrees
+        ) else {
+            try? FileManager.default.removeItem(at: lazURL)
+            try? FileManager.default.removeItem(at: sidecarURL)
+            return nil
+        }
+
+        progress?(1.0, "Finalizing export...")
+        return ExportArtifact(primaryURL: lazURL, sidecarURL: sidecarURL)
+    }
+
+    func exportReportPDFOnly(
+        fromSnapshot data: Data,
+        pointCount: Int,
+        suggestedName: String,
+        session: ScanSession,
+        captureMetadata: ScanCaptureMetadata?,
+        measurements: [ScanReportMeasurement],
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> URL? {
+        let safeBase = sanitizeFileName(suggestedName).isEmpty ? "Scan" : sanitizeFileName(suggestedName)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let timestamp = formatter.string(from: Date())
+        let reportURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(safeBase)_\(timestamp)_report.pdf")
+
+        return generateExportReportPDF(
+            fromSnapshot: data,
+            pointCount: pointCount,
+            session: session,
+            captureMetadata: captureMetadata,
+            exportFormat: .pdfReport,
+            primaryURL: nil,
+            sidecarURL: nil,
+            reportURLOverride: reportURL,
+            measurements: measurements,
+            progress: progress,
+            isCancelled: isCancelled
+        )
+    }
+
+    func generateExportReportPDF(
+        fromSnapshot data: Data,
+        pointCount: Int,
+        session: ScanSession,
+        captureMetadata: ScanCaptureMetadata?,
+        exportFormat: ExportFormat,
+        primaryURL: URL?,
+        sidecarURL: URL?,
+        reportURLOverride: URL? = nil,
+        measurements: [ScanReportMeasurement],
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> URL? {
+        if isCancelled?() == true { return nil }
+        progress?(0.02, "Analyzing point cloud...")
+
+        guard let stats = computeSnapshotPointStats(
+            fromSnapshot: data,
+            fallbackPointCount: pointCount,
+            exportFormat: exportFormat,
+            captureMetadata: captureMetadata,
+            isCancelled: isCancelled
+        ) else { return nil }
+        progress?(0.12, "Preparing report assets...")
+
+        let reportURL: URL = {
+            if let reportURLOverride { return reportURLOverride }
+            if let primaryURL {
+                let baseName = primaryURL.deletingPathExtension().lastPathComponent
+                return primaryURL.deletingLastPathComponent()
+                    .appendingPathComponent("\(baseName)_report.pdf")
+            }
+            let safeBase = sanitizeFileName(session.name).isEmpty ? "Scan" : sanitizeFileName(session.name)
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+            let timestamp = formatter.string(from: Date())
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(safeBase)_\(timestamp)_report.pdf")
+        }()
+
+        let previewPoints = extractReportPreviewPoints(
+            fromSnapshot: data,
+            exportFormat: exportFormat,
+            captureMetadata: captureMetadata,
+            targetMaxPoints: 60_000,
+            isCancelled: isCancelled
+        )
+        let analysisPoints = extractReportPreviewPoints(
+            fromSnapshot: data,
+            exportFormat: exportFormat,
+            captureMetadata: captureMetadata,
+            targetMaxPoints: 180_000,
+            isCancelled: isCancelled
+        )
+        progress?(0.24, "Rendering visual evidence...")
+        let rgbPreviewPanel = previewPoints.flatMap {
+            makeReportPreviewPanelImage(
+                points: $0,
+                measurements: measurements,
+                exportFormat: exportFormat,
+                captureMetadata: captureMetadata,
+                style: .rgb
+            )
+        }
+        progress?(0.36, "Rendering elevation visual evidence...")
+        let elevationPreviewPanel = previewPoints.flatMap {
+            makeReportPreviewPanelImage(
+                points: $0,
+                measurements: measurements,
+                exportFormat: exportFormat,
+                captureMetadata: captureMetadata,
+                style: .elevation
+            )
+        }
+        progress?(0.46, "Computing measurement analysis...")
+        let measurementAnalysisByID: [String: MeasurementPointCloudAnalysis] = {
+            guard let analysisPoints else { return [:] }
+            return buildMeasurementAnalyses(
+                measurements: measurements,
+                cloudPoints: analysisPoints,
+                exportFormat: exportFormat,
+                captureMetadata: captureMetadata
+            )
+        }()
+        progress?(0.56, "Generating report pages...")
+
+        let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let renderer = UIGraphicsPDFRenderer(bounds: pageRect)
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
+        let numberFormatter = NumberFormatter()
+        numberFormatter.maximumFractionDigits = 2
+        numberFormatter.minimumFractionDigits = 2
+        let oneDecimalFormatter = NumberFormatter()
+        oneDecimalFormatter.maximumFractionDigits = 1
+        oneDecimalFormatter.minimumFractionDigits = 1
+
+        let byteFormatter = ByteCountFormatter()
+        byteFormatter.allowedUnits = [.useKB, .useMB, .useGB]
+        byteFormatter.countStyle = .file
+        byteFormatter.isAdaptive = true
+
+        let exportFormatLabel: String = {
+            switch exportFormat {
+            case .laz: return "LAZ"
+            case .plyBinaryLittleEndian: return "PLY (Binary)"
+            case .plyAscii: return "PLY (ASCII)"
+            case .pdfReport: return "PDF Report"
+            }
+        }()
+
+        let georefMode: String = {
+            if captureMetadata?.location != nil && exportFormat == .laz { return "GPS Approximate" }
+            if captureMetadata?.location != nil { return "GPS Captured (local coordinates)" }
+            return "Local Only"
+        }()
+
+        let qualityStatus: String = {
+            if stats.pointCount >= 200_000 { return "GOOD" }
+            if stats.pointCount >= 50_000 { return "WARNING" }
+            return "POOR"
+        }()
+
+        let qualityScore: Int = {
+            if stats.pointCount <= 0 { return 0 }
+            let normalized = min(1.0, max(0.0, log10(Double(stats.pointCount)) / 6.0))
+            return Int((normalized * 100.0).rounded())
+        }()
+
+        progress?(0.62, "Composing report pages...")
+        do {
+            try renderer.writePDF(to: reportURL) { ctx in
+                let brandBlue = UIColor.systemBlue
+                let bodyColor = UIColor.black
+                let mutedColor = UIColor(white: 0.25, alpha: 1.0)
+                let cardStroke = UIColor(white: 0.86, alpha: 1.0)
+                let margin: CGFloat = 36
+                let contentWidth = pageRect.width - margin * 2
+                var y: CGFloat = margin + 16
+                var pageIndex = 1
+                var sectionTopY: CGFloat?
+
+                let shortDateFormatter = DateFormatter()
+                shortDateFormatter.dateFormat = "yyyy-MM-dd HH:mm"
+
+                func beginPage() {
+                    ctx.beginPage()
+                    y = margin + 16
+
+                    let topRule = UIBezierPath()
+                    topRule.move(to: CGPoint(x: margin, y: 30))
+                    topRule.addLine(to: CGPoint(x: pageRect.width - margin, y: 30))
+                    brandBlue.setStroke()
+                    topRule.lineWidth = 1.0
+                    topRule.stroke()
+
+                    "PointPro Point Cloud Survey Report".draw(
+                        at: CGPoint(x: margin, y: 14),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: 10, weight: .semibold),
+                            .foregroundColor: mutedColor
+                        ]
+                    )
+
+                    let footerBrand = "POINTPRO"
+                    footerBrand.draw(
+                        at: CGPoint(x: margin, y: pageRect.height - 22),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: 9, weight: .bold),
+                            .foregroundColor: brandBlue
+                        ]
+                    )
+
+                    let footerTagline = "Field Capture to Deliverable"
+                    let tagSize = footerTagline.size(withAttributes: [.font: UIFont.systemFont(ofSize: 9)])
+                    footerTagline.draw(
+                        at: CGPoint(x: pageRect.midX - (tagSize.width / 2), y: pageRect.height - 22),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: 9),
+                            .foregroundColor: mutedColor
+                        ]
+                    )
+
+                    let footerPage = "Page \(pageIndex)"
+                    let footerPageSize = footerPage.size(withAttributes: [.font: UIFont.systemFont(ofSize: 9)])
+                    footerPage.draw(
+                        at: CGPoint(x: pageRect.width - margin - footerPageSize.width, y: pageRect.height - 22),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: 9),
+                            .foregroundColor: mutedColor
+                        ]
+                    )
+
+                    pageIndex += 1
+                }
+
+                func finishSection() {
+                    guard let top = sectionTopY else { return }
+                    let rect = CGRect(x: margin, y: top, width: contentWidth, height: max(30, y - top + 8))
+                    let path = UIBezierPath(roundedRect: rect, cornerRadius: 8)
+                    cardStroke.setStroke()
+                    path.lineWidth = 0.8
+                    path.stroke()
+                    sectionTopY = nil
+                    y = rect.maxY + 10
+                }
+
+                func ensureSpace(_ height: CGFloat) {
+                    if y + height > pageRect.height - margin - 34 {
+                        finishSection()
+                        beginPage()
+                    }
+                }
+
+                func lineX() -> CGFloat { sectionTopY == nil ? margin : (margin + 12) }
+                func lineWidth() -> CGFloat { sectionTopY == nil ? contentWidth : (contentWidth - 24) }
+
+                @discardableResult
+                func drawLine(_ text: String, font: UIFont, color: UIColor = .black, spacing: CGFloat = 4) -> CGFloat {
+                    let attributes: [NSAttributedString.Key: Any] = [
+                        .font: font,
+                        .foregroundColor: color
+                    ]
+                    let width = lineWidth()
+                    let x = lineX()
+                    let rect = NSString(string: text).boundingRect(
+                        with: CGSize(width: width, height: .greatestFiniteMagnitude),
+                        options: [.usesLineFragmentOrigin, .usesFontLeading],
+                        attributes: attributes,
+                        context: nil
+                    )
+                    let drawRect = CGRect(x: x, y: y, width: width, height: ceil(rect.height))
+                    ensureSpace(drawRect.height + spacing)
+                    NSString(string: text).draw(in: drawRect, withAttributes: attributes)
+                    y += ceil(rect.height) + spacing
+                    return ceil(rect.height) + spacing
+                }
+
+                func startSection(_ title: String, minBodyHeight: CGFloat = 52) {
+                    finishSection()
+                    ensureSpace(minBodyHeight + 30)
+                    sectionTopY = y
+                    y += 10
+                    _ = drawLine(title.uppercased(), font: UIFont.systemFont(ofSize: 12.5, weight: .bold), color: brandBlue, spacing: 6)
+                }
+
+                func drawKV(_ key: String, _ value: String) {
+                    let line = "\(key): \(value)"
+                    _ = drawLine(line, font: UIFont.monospacedSystemFont(ofSize: 10.5, weight: .regular), color: bodyColor, spacing: 3)
+                }
+
+                beginPage()
+                _ = drawLine("Point Cloud Survey Report", font: UIFont.systemFont(ofSize: 24, weight: .bold), color: bodyColor, spacing: 8)
+                _ = drawLine(session.name, font: UIFont.systemFont(ofSize: 16, weight: .semibold), color: bodyColor, spacing: 14)
+
+                startSection("Document Control", minBodyHeight: 72)
+                drawKV("Report ID", UUID().uuidString)
+                drawKV("Generated At", dateFormatter.string(from: Date()))
+                drawKV("Timezone", TimeZone.current.identifier)
+                drawKV("Template Version", "enterprise-v1")
+                drawKV("Export Format", exportFormatLabel)
+
+                startSection("Executive Summary", minBodyHeight: 84)
+                drawKV("Points", "\(stats.pointCount)")
+                drawKV("Extent X", "\(numberFormatter.string(from: NSNumber(value: stats.extentX)) ?? "0.00") m")
+                drawKV("Extent Y", "\(numberFormatter.string(from: NSNumber(value: stats.extentY)) ?? "0.00") m")
+                drawKV("Extent Z", "\(numberFormatter.string(from: NSNumber(value: stats.extentZ)) ?? "0.00") m")
+                drawKV("Georeference Mode", georefMode)
+                drawKV("Measurements", "\(measurements.count)")
+
+                startSection("Scan Metadata", minBodyHeight: 90)
+                drawKV("Scan ID", session.id.uuidString)
+                drawKV("Created", dateFormatter.string(from: session.createdAt))
+                drawKV("Updated", dateFormatter.string(from: session.updatedAt))
+                drawKV("Status", session.status.rawValue.uppercased())
+                drawKV("App Version", captureMetadata?.appVersion ?? "Unknown")
+                drawKV("Device", captureMetadata?.deviceModel ?? "Unknown")
+                drawKV("OS", "\(captureMetadata?.systemName ?? "iOS") \(captureMetadata?.systemVersion ?? "")")
+
+                startSection("Spatial Reference / Georeferencing", minBodyHeight: 88)
+                let epsg = inferredEPSG(from: captureMetadata?.location)
+                drawKV("Mode", georefMode)
+                drawKV("EPSG", epsg.map(String.init) ?? "N/A")
+                drawKV("CRS", inferredCRSName(from: captureMetadata?.location, epsg: epsg) ?? "Local Frame")
+                if let location = captureMetadata?.location {
+                    drawKV("Lat / Lon", String(format: "%.6f, %.6f", location.latitude, location.longitude))
+                    drawKV("Altitude", String(format: "%.1f m", location.altitude))
+                    if location.horizontalAccuracy > 0 {
+                        drawKV("Horizontal Accuracy", "\(oneDecimalFormatter.string(from: NSNumber(value: location.horizontalAccuracy)) ?? "N/A") m")
+                    } else {
+                        drawKV("Horizontal Accuracy", "Unknown")
+                    }
+                    if let heading = location.headingDegrees {
+                        drawKV("Heading", String(format: "%.1f°", heading))
+                    } else {
+                        drawKV("Heading", "N/A")
+                    }
+                } else {
+                    drawKV("Anchor", "Not available")
+                }
+
+                startSection("Data Inventory", minBodyHeight: 72)
+                if let primaryURL {
+                    let primarySize = (try? FileManager.default.attributesOfItem(atPath: primaryURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    drawKV("Primary File", primaryURL.lastPathComponent)
+                    drawKV("Primary Size", byteFormatter.string(fromByteCount: primarySize))
+                } else {
+                    drawKV("Primary File", "Report Only")
+                    drawKV("Primary Size", "N/A")
+                }
+                if let sidecarURL {
+                    let sidecarSize = (try? FileManager.default.attributesOfItem(atPath: sidecarURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    drawKV("Metadata File", sidecarURL.lastPathComponent)
+                    drawKV("Metadata Size", byteFormatter.string(fromByteCount: sidecarSize))
+                } else {
+                    drawKV("Metadata File", "Not generated")
+                }
+                drawKV("Report File", reportURL.lastPathComponent)
+
+                startSection("Point Cloud Statistics", minBodyHeight: 74)
+                drawKV("Point Count", "\(stats.pointCount)")
+                drawKV("Bounds Min", String(format: "[%.3f, %.3f, %.3f]", stats.boundsMin[0], stats.boundsMin[1], stats.boundsMin[2]))
+                drawKV("Bounds Max", String(format: "[%.3f, %.3f, %.3f]", stats.boundsMax[0], stats.boundsMax[1], stats.boundsMax[2]))
+                drawKV("Extent (X/Y/Z)", String(format: "%.3f / %.3f / %.3f m", stats.extentX, stats.extentY, stats.extentZ))
+                drawKV("Color", "RGB")
+
+                startSection("Quality and Risk", minBodyHeight: 48)
+                drawKV("Quality Score", "\(qualityScore)/100")
+                drawKV("Coverage Status", qualityStatus)
+                drawKV("Risk Note", "GPS georeference is approximate; use GCP/checkpoints for high-accuracy workflows.")
+                progress?(0.72, "Writing measurement sections...")
+
+                startSection("Measurement Register", minBodyHeight: measurements.isEmpty ? 40 : 92)
+                if measurements.isEmpty {
+                    drawKV("Measurements", "No measurements recorded")
+                } else {
+                    let tableX = lineX()
+                    let tableWidth = lineWidth()
+                    let headerH: CGFloat = 18
+                    let rowH: CGFloat = 18
+                    let columns: [CGFloat] = [0.00, 0.09, 0.22, 0.31, 0.43, 0.55, 0.67, 1.00]
+
+                    func cellRect(_ rowY: CGFloat, _ col: Int, _ height: CGFloat) -> CGRect {
+                        let left = tableX + (columns[col] * tableWidth)
+                        let right = tableX + (columns[col + 1] * tableWidth)
+                        return CGRect(x: left + 3, y: rowY + 3, width: max(0, right - left - 6), height: max(0, height - 6))
+                    }
+
+                    func drawCellText(_ text: String, _ rect: CGRect, _ font: UIFont, _ color: UIColor = .black) {
+                        NSString(string: text).draw(
+                            in: rect,
+                            withAttributes: [
+                                .font: font,
+                                .foregroundColor: color
+                            ]
+                        )
+                    }
+
+                    ensureSpace(headerH + rowH + 10)
+                    let headerRect = CGRect(x: tableX, y: y, width: tableWidth, height: headerH)
+                    UIColor(white: 0.95, alpha: 1).setFill()
+                    UIRectFill(headerRect)
+                    UIColor(white: 0.82, alpha: 1).setStroke()
+                    UIBezierPath(rect: headerRect).stroke()
+
+                    let headerFont = UIFont.systemFont(ofSize: 8.2, weight: .bold)
+                    drawCellText("#", cellRect(y, 0, headerH), headerFont)
+                    drawCellText("Type", cellRect(y, 1, headerH), headerFont)
+                    drawCellText("Vtx", cellRect(y, 2, headerH), headerFont)
+                    drawCellText("Len", cellRect(y, 3, headerH), headerFont)
+                    drawCellText("Perim", cellRect(y, 4, headerH), headerFont)
+                    drawCellText("Area", cellRect(y, 5, headerH), headerFont)
+                    drawCellText("Created", cellRect(y, 6, headerH), headerFont)
+                    y += headerH
+
+                    for (idx, measurement) in measurements.enumerated() {
+                        if y + rowH > pageRect.height - margin - 40 {
+                            finishSection()
+                            beginPage()
+                            startSection("Measurement Register (cont.)", minBodyHeight: 92)
+                            ensureSpace(headerH + rowH + 8)
+                            let continuedHeaderRect = CGRect(x: tableX, y: y, width: tableWidth, height: headerH)
+                            UIColor(white: 0.95, alpha: 1).setFill()
+                            UIRectFill(continuedHeaderRect)
+                            UIColor(white: 0.82, alpha: 1).setStroke()
+                            UIBezierPath(rect: continuedHeaderRect).stroke()
+                            drawCellText("#", cellRect(y, 0, headerH), headerFont)
+                            drawCellText("Type", cellRect(y, 1, headerH), headerFont)
+                            drawCellText("Vtx", cellRect(y, 2, headerH), headerFont)
+                            drawCellText("Len", cellRect(y, 3, headerH), headerFont)
+                            drawCellText("Perim", cellRect(y, 4, headerH), headerFont)
+                            drawCellText("Area", cellRect(y, 5, headerH), headerFont)
+                            drawCellText("Created", cellRect(y, 6, headerH), headerFont)
+                            y += headerH
+                        }
+
+                        let rowRect = CGRect(x: tableX, y: y, width: tableWidth, height: rowH)
+                        UIColor(white: 0.92, alpha: idx % 2 == 0 ? 0.0 : 0.35).setFill()
+                        UIRectFill(rowRect)
+                        UIColor(white: 0.87, alpha: 1).setStroke()
+                        UIBezierPath(rect: rowRect).stroke()
+
+                        let typeLabel: String = {
+                            switch measurement.type {
+                            case .distance: return "Distance"
+                            case .polyline: return "Polyline"
+                            case .closedArea: return "Area"
+                            case .crossSection: return "Cross"
+                            case .elevationProfile: return "Elev"
+                            }
+                        }()
+                        let rowFont = UIFont.systemFont(ofSize: 8.2, weight: .regular)
+                        drawCellText("M\(idx + 1)", cellRect(y, 0, rowH), rowFont)
+                        drawCellText(typeLabel, cellRect(y, 1, rowH), rowFont)
+                        drawCellText("\(measurement.vertexCount)", cellRect(y, 2, rowH), rowFont)
+                        drawCellText(measurement.lengthMeters.map { String(format: "%.2f", $0) } ?? "-", cellRect(y, 3, rowH), rowFont)
+                        drawCellText(measurement.perimeterMeters.map { String(format: "%.2f", $0) } ?? "-", cellRect(y, 4, rowH), rowFont)
+                        drawCellText(measurement.areaSquareMeters.map { String(format: "%.2f", $0) } ?? "-", cellRect(y, 5, rowH), rowFont)
+                        drawCellText(shortDateFormatter.string(from: measurement.createdAt), cellRect(y, 6, rowH), UIFont.systemFont(ofSize: 7.7))
+                        y += rowH
+                    }
+
+                    y += 3
+                    _ = drawLine("Legend: Preview image uses the same IDs (M1, M2, ...).", font: UIFont.systemFont(ofSize: 9.2), color: mutedColor, spacing: 2)
+                }
+
+                let indexedMeasurements: [(Int, ScanReportMeasurement)] = measurements.enumerated().map { ($0 + 1, $1) }
+                let crossSections = indexedMeasurements.filter { $0.1.type == .crossSection }
+                let elevationProfiles = indexedMeasurements.filter { $0.1.type == .elevationProfile }
+
+                if !crossSections.isEmpty {
+                    startSection("Cross Section Analysis", minBodyHeight: 74)
+                    for (index, measurement) in crossSections {
+                        let analysis = measurementAnalysisByID[measurement.id]
+                        let minElevation = analysis?.minElevation ?? measurement.minElevationMeters
+                        let maxElevation = analysis?.maxElevation ?? measurement.maxElevationMeters
+                        let relief = analysis?.relief ?? measurement.reliefMeters
+                        ensureSpace(214)
+                        drawKV("ID", "M\(index)")
+                        drawKV("Path Length", (analysis?.profileLength ?? measurement.lengthMeters).map { String(format: "%.2f m", $0) } ?? "N/A")
+                        drawKV("Swath Width", measurement.swathWidthMeters.map { String(format: "%.2f m", $0) } ?? "N/A")
+                        let binLabel = analysis?.profileBinWidthMeters.map { String(format: "%.3f m", $0) } ?? "N/A"
+                        let windowLabel = analysis?.stationWindowMeters.map { String(format: "%.3f m", $0) } ?? "N/A"
+                        drawKV("Sample Bin / Station Window", "\(binLabel) / \(windowLabel)")
+                        let sliceLabel = analysis.map { String($0.sectionScatter.count) } ?? "N/A"
+                        let corridorLabel = analysis.map { String($0.corridorPointCount) } ?? "N/A"
+                        let cloudLabel = analysis.map { String($0.sourcePointCount) } ?? "N/A"
+                        drawKV("Sampled Points (Slice / Corridor / Cloud)", "\(sliceLabel) / \(corridorLabel) / \(cloudLabel)")
+                        if let minElevation, let maxElevation {
+                            drawKV("Elevation Min / Max", String(format: "%.2f / %.2f m", minElevation, maxElevation))
+                        } else {
+                            drawKV("Elevation Min / Max", "N/A")
+                        }
+                        drawKV("Relief", relief.map { String(format: "%.2f m", $0) } ?? "N/A")
+                        if let graphImage = makeMeasurementGraphImage(
+                            measurement: measurement,
+                            analysis: analysis,
+                            title: "Cross Section M\(index)",
+                            lineColor: .systemGreen
+                        ) {
+                            let graphHeight = min(140, max(108, lineWidth() * 0.30))
+                            ensureSpace(graphHeight + 10)
+                            graphImage.draw(in: CGRect(x: lineX(), y: y, width: lineWidth(), height: graphHeight))
+                            y += graphHeight + 5
+                        }
+                        _ = drawLine(" ", font: UIFont.systemFont(ofSize: 4), color: .clear, spacing: 1)
+                    }
+                }
+
+                if !elevationProfiles.isEmpty {
+                    startSection("Elevation Profile Analysis", minBodyHeight: 84)
+                    for (index, measurement) in elevationProfiles {
+                        let analysis = measurementAnalysisByID[measurement.id]
+                        let minElevation = analysis?.minElevation ?? measurement.minElevationMeters
+                        let maxElevation = analysis?.maxElevation ?? measurement.maxElevationMeters
+                        let totalRise = analysis?.totalRise ?? measurement.totalRiseMeters
+                        let totalFall = analysis?.totalFall ?? measurement.totalFallMeters
+                        let averageSlope = analysis?.averageSlopePercent ?? measurement.averageSlopePercent
+                        let maxSlope = analysis?.maxSlopePercent ?? measurement.maxSlopePercent
+                        ensureSpace(214)
+                        drawKV("ID", "M\(index)")
+                        drawKV("Profile Length", (analysis?.profileLength ?? measurement.lengthMeters).map { String(format: "%.2f m", $0) } ?? "N/A")
+                        drawKV("Sample Bin Width", analysis?.profileBinWidthMeters.map { String(format: "%.3f m", $0) } ?? "N/A")
+                        let corridorLabel = analysis.map { String($0.corridorPointCount) } ?? "N/A"
+                        let cloudLabel = analysis.map { String($0.sourcePointCount) } ?? "N/A"
+                        drawKV("Sampled Points (Corridor / Cloud)", "\(corridorLabel) / \(cloudLabel)")
+                        if let minElevation, let maxElevation {
+                            drawKV("Elevation Min / Max", String(format: "%.2f / %.2f m", minElevation, maxElevation))
+                        } else {
+                            drawKV("Elevation Min / Max", "N/A")
+                        }
+                        drawKV("Total Rise / Fall", String(
+                            format: "%.2f / %.2f m",
+                            totalRise ?? 0,
+                            totalFall ?? 0
+                        ))
+                        drawKV("Average / Max Slope", String(
+                            format: "%.1f%% / %.1f%%",
+                            averageSlope ?? 0,
+                            maxSlope ?? 0
+                        ))
+                        if let graphImage = makeMeasurementGraphImage(
+                            measurement: measurement,
+                            analysis: analysis,
+                            title: "Elevation Profile M\(index)",
+                            lineColor: .systemBlue
+                        ) {
+                            let graphHeight = min(150, max(116, lineWidth() * 0.32))
+                            ensureSpace(graphHeight + 10)
+                            graphImage.draw(in: CGRect(x: lineX(), y: y, width: lineWidth(), height: graphHeight))
+                            y += graphHeight + 5
+                        }
+                        _ = drawLine(" ", font: UIFont.systemFont(ofSize: 4), color: .clear, spacing: 1)
+                    }
+                }
+                progress?(0.84, "Writing visual evidence...")
+
+                startSection("Visual Evidence", minBodyHeight: 340)
+                if let rgbPreviewPanel {
+                    _ = drawLine("RGB Multi-view (Front / Back / Top / Side)", font: UIFont.systemFont(ofSize: 9.8, weight: .semibold), color: bodyColor, spacing: 4)
+                    let ratio = rgbPreviewPanel.size.height / max(rgbPreviewPanel.size.width, 1)
+                    let imageHeight = min(300, max(190, lineWidth() * ratio))
+                    ensureSpace(imageHeight + 12)
+                    rgbPreviewPanel.draw(in: CGRect(x: lineX(), y: y, width: lineWidth(), height: imageHeight))
+                    y += imageHeight + 6
+                    _ = drawLine("Point cloud rendered in captured RGB with measurement overlays.", font: UIFont.systemFont(ofSize: 9.2), color: mutedColor, spacing: 5)
+                }
+                if let elevationPreviewPanel {
+                    _ = drawLine("Elevation Gradient Multi-view (Front / Back / Top / Side)", font: UIFont.systemFont(ofSize: 9.8, weight: .semibold), color: bodyColor, spacing: 4)
+                    let ratio = elevationPreviewPanel.size.height / max(elevationPreviewPanel.size.width, 1)
+                    let imageHeight = min(300, max(190, lineWidth() * ratio))
+                    ensureSpace(imageHeight + 12)
+                    elevationPreviewPanel.draw(in: CGRect(x: lineX(), y: y, width: lineWidth(), height: imageHeight))
+                    y += imageHeight + 6
+                    _ = drawLine("Point cloud rendered by elevation gradient (low to high).", font: UIFont.systemFont(ofSize: 9.2), color: mutedColor, spacing: 2)
+                }
+                if rgbPreviewPanel == nil && elevationPreviewPanel == nil {
+                    drawKV("Preview", "Unavailable")
+                } else {
+                    _ = drawLine("Legend IDs map to Measurement Register (M1, M2, ...).", font: UIFont.systemFont(ofSize: 9.2), color: mutedColor, spacing: 2)
+                }
+
+                startSection("Deliverables Checklist", minBodyHeight: 40)
+                drawKV("Primary Export", primaryURL == nil ? "Not Included (Report Only)" : "Included")
+                drawKV("Metadata Sidecar", sidecarURL == nil ? "Not Included" : "Included")
+                drawKV("PDF Report", "Included")
+
+                startSection("Compliance + Disclaimer", minBodyHeight: 36)
+                _ = drawLine("GPS approximate only. Not survey-grade georeferencing.", font: UIFont.systemFont(ofSize: 10.5, weight: .regular), color: bodyColor, spacing: 2)
+                _ = drawLine("Use GCP/checkpoints for high-accuracy workflows.", font: UIFont.systemFont(ofSize: 10.5, weight: .regular), color: bodyColor, spacing: 8)
+                progress?(0.93, "Finalizing annex...")
+
+                startSection("Technical Annex", minBodyHeight: 44)
+                drawKV("Depth Resolution", captureMetadata?.depthResolution.map(String.init).joined(separator: "x") ?? "Unknown")
+                drawKV("Color Resolution", captureMetadata?.colorResolution.map(String.init).joined(separator: "x") ?? "Unknown")
+                if let transform = captureMetadata?.worldOriginTransform {
+                    let preview = transform.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", ")
+                    drawKV("World Origin Matrix (partial)", preview)
+                } else {
+                    drawKV("World Origin Matrix", "Not available")
+                }
+
+                finishSection()
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: reportURL)
+            return nil
+        }
+
+        progress?(1.0, "Finalizing report...")
+        return reportURL
+    }
+
+    private struct LAZWriteResult {
+        let pointCount: Int
+        let scale: [Double]
+        let offset: [Double]
+        let boundsMin: [Double]
+        let boundsMax: [Double]
+        let epsg: Int?
+        let crsName: String?
+        let georefNote: String?
+        let headingDegrees: Double?
+    }
+
+    private struct SnapshotPointStats {
+        let pointCount: Int
+        let boundsMin: [Double]
+        let boundsMax: [Double]
+        let extentX: Double
+        let extentY: Double
+        let extentZ: Double
+    }
+
+    private func inferredEPSG(from location: CaptureLocationMetadata?) -> Int? {
+        guard let location else { return nil }
+        let latitude = location.latitude
+        let longitude = location.longitude
+        guard latitude.isFinite, longitude.isFinite else { return nil }
+        guard abs(latitude) <= 84.0, abs(longitude) <= 180.0 else { return nil }
+        let zone = max(1, min(60, Int(floor((longitude + 180.0) / 6.0)) + 1))
+        return (latitude >= 0 ? 32600 : 32700) + zone
+    }
+
+    private func inferredCRSName(from location: CaptureLocationMetadata?, epsg: Int?) -> String? {
+        guard let location, epsg != nil else { return nil }
+        let zone = max(1, min(60, Int(floor((location.longitude + 180.0) / 6.0)) + 1))
+        let hemisphere = location.latitude >= 0 ? "N" : "S"
+        return "WGS 84 / UTM zone \(zone)\(hemisphere)"
+    }
+
+    private func computeSnapshotPointStats(
+        fromSnapshot data: Data,
+        fallbackPointCount: Int,
+        exportFormat: ExportFormat,
+        captureMetadata: ScanCaptureMetadata?,
+        isCancelled: (() -> Bool)? = nil
+    ) -> SnapshotPointStats? {
+        let voxelStride = MemoryLayout<Voxel>.stride
+        let headerSize = MemoryLayout<UInt32>.size * 3
+        let recordSize = MemoryLayout<UInt32>.size + voxelStride
+
+        func readUInt32(at offset: Int) -> UInt32? {
+            guard offset + MemoryLayout<UInt32>.size <= data.count else { return nil }
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + MemoryLayout<UInt32>.size))
+            }
+            return value
+        }
+
+        func readVoxel(at offset: Int) -> Voxel? {
+            guard offset + voxelStride <= data.count else { return nil }
+            var voxel = Voxel(positionAndConfidence: .zero, colorAndSampleCount: .zero)
+            _ = withUnsafeMutableBytes(of: &voxel) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + voxelStride))
+            }
+            return voxel
+        }
+
+        let crsContext = exportFormat == .laz ? makeApproximateCRSContext(captureMetadata: captureMetadata) : nil
+        func transformedPoint(_ voxel: Voxel) -> (x: Double, y: Double, z: Double) {
+            let px = Double(voxel.positionAndConfidence.x)
+            let py = Double(voxel.positionAndConfidence.y)
+            let pz = Double(voxel.positionAndConfidence.z)
+            if let crsContext {
+                return crsContext.transform(localX: px, localY: py, localZ: pz)
+            }
+            return (px, py, pz)
+        }
+
+        var minX = Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var minZ = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        var maxZ = -Double.greatestFiniteMagnitude
+        var counted = 0
+
+        let isCompact = data.count >= headerSize &&
+            readUInt32(at: 0) == 0x50435331 &&
+            readUInt32(at: MemoryLayout<UInt32>.size) == 1
+
+        if isCompact, let storedCount = readUInt32(at: 2 * MemoryLayout<UInt32>.size) {
+            let count = min(Int(storedCount), max(0, (data.count - headerSize) / recordSize))
+            var offset = headerSize
+            for _ in 0..<count {
+                if isCancelled?() == true { return nil }
+                guard offset + recordSize <= data.count else { break }
+                let idx = readUInt32(at: offset) ?? UInt32.max
+                offset += MemoryLayout<UInt32>.size
+                guard idx < UInt32(maxVoxels), let voxel = readVoxel(at: offset) else {
+                    offset += voxelStride
+                    continue
+                }
+                offset += voxelStride
+                let point = transformedPoint(voxel)
+                minX = min(minX, point.x)
+                minY = min(minY, point.y)
+                minZ = min(minZ, point.z)
+                maxX = max(maxX, point.x)
+                maxY = max(maxY, point.y)
+                maxZ = max(maxZ, point.z)
+                counted += 1
+            }
+        } else if data.count == voxelBuffer.length {
+            for offset in stride(from: 0, to: data.count, by: voxelStride) {
+                if isCancelled?() == true { return nil }
+                guard let voxel = readVoxel(at: offset) else { break }
+                if voxel.colorAndSampleCount.w <= 0 {
+                    continue
+                }
+                let point = transformedPoint(voxel)
+                minX = min(minX, point.x)
+                minY = min(minY, point.y)
+                minZ = min(minZ, point.z)
+                maxX = max(maxX, point.x)
+                maxY = max(maxY, point.y)
+                maxZ = max(maxZ, point.z)
+                counted += 1
+            }
+        } else {
+            return nil
+        }
+
+        let finalCount = max(counted, max(0, fallbackPointCount))
+        guard finalCount > 0 else { return nil }
+        guard minX.isFinite, minY.isFinite, minZ.isFinite, maxX.isFinite, maxY.isFinite, maxZ.isFinite else {
+            return nil
+        }
+        return SnapshotPointStats(
+            pointCount: finalCount,
+            boundsMin: [minX, minY, minZ],
+            boundsMax: [maxX, maxY, maxZ],
+            extentX: max(0, maxX - minX),
+            extentY: max(0, maxY - minY),
+            extentZ: max(0, maxZ - minZ)
+        )
+    }
+
+    private enum ReportPreviewStyle {
+        case rgb
+        case elevation
+    }
+
+    private enum ReportPreviewViewKind: CaseIterable {
+        case front
+        case back
+        case top
+        case side
+
+        var title: String {
+            switch self {
+            case .front: return "Front"
+            case .back: return "Back"
+            case .top: return "Top"
+            case .side: return "Side"
+            }
+        }
+
+        func project(_ p: SIMD3<Double>) -> CGPoint {
+            switch self {
+            case .front:
+                return CGPoint(x: p.x, y: p.y)
+            case .back:
+                return CGPoint(x: -p.x, y: p.y)
+            case .top:
+                return CGPoint(x: p.x, y: p.z)
+            case .side:
+                return CGPoint(x: p.z, y: p.y)
+            }
+        }
+    }
+
+    private struct ReportPreviewPoint {
+        let position: SIMD3<Double>
+        let color: UIColor
+    }
+
+    private func extractReportPreviewPoints(
+        fromSnapshot data: Data,
+        exportFormat: ExportFormat,
+        captureMetadata: ScanCaptureMetadata?,
+        targetMaxPoints: Int = 60_000,
+        isCancelled: (() -> Bool)? = nil
+    ) -> [ReportPreviewPoint]? {
+        let voxelStride = MemoryLayout<Voxel>.stride
+        let headerSize = MemoryLayout<UInt32>.size * 3
+        let recordSize = MemoryLayout<UInt32>.size + voxelStride
+
+        func readUInt32(at offset: Int) -> UInt32? {
+            guard offset + MemoryLayout<UInt32>.size <= data.count else { return nil }
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + MemoryLayout<UInt32>.size))
+            }
+            return value
+        }
+
+        func readVoxel(at offset: Int) -> Voxel? {
+            guard offset + voxelStride <= data.count else { return nil }
+            var voxel = Voxel(positionAndConfidence: .zero, colorAndSampleCount: .zero)
+            _ = withUnsafeMutableBytes(of: &voxel) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + voxelStride))
+            }
+            return voxel
+        }
+
+        let crsContext = exportFormat == .laz ? makeApproximateCRSContext(captureMetadata: captureMetadata) : nil
+        func transformedPoint(_ x: Double, _ y: Double, _ z: Double) -> SIMD3<Double> {
+            if let crsContext {
+                let t = crsContext.transform(localX: x, localY: y, localZ: z)
+                return SIMD3<Double>(t.x, t.y, t.z)
+            }
+            return SIMD3<Double>(x, y, z)
+        }
+
+        func voxelColor(_ voxel: Voxel) -> UIColor {
+            func normalized(_ value: Float) -> CGFloat {
+                let scaled = value <= 1.0 ? value * 255.0 : value
+                return CGFloat(max(0, min(255, Int(scaled.rounded())))) / 255.0
+            }
+            let r = normalized(voxel.colorAndSampleCount.x)
+            let g = normalized(voxel.colorAndSampleCount.y)
+            let b = normalized(voxel.colorAndSampleCount.z)
+            return UIColor(red: r, green: g, blue: b, alpha: 1.0)
+        }
+
+        let targetCount = max(5_000, targetMaxPoints)
+        var samples: [ReportPreviewPoint] = []
+        samples.reserveCapacity(min(targetCount + 5_000, max(10_000, targetCount)))
+
+        let isCompact = data.count >= headerSize &&
+            readUInt32(at: 0) == 0x50435331 &&
+            readUInt32(at: MemoryLayout<UInt32>.size) == 1
+
+        if isCompact, let storedCount = readUInt32(at: 2 * MemoryLayout<UInt32>.size) {
+            let count = min(Int(storedCount), max(0, (data.count - headerSize) / recordSize))
+            let sampleStride = max(1, count / targetCount)
+            var offset = headerSize
+            for i in 0..<count {
+                if isCancelled?() == true { return nil }
+                guard offset + recordSize <= data.count else { break }
+                let idx = readUInt32(at: offset) ?? UInt32.max
+                offset += MemoryLayout<UInt32>.size
+                guard idx < UInt32(maxVoxels), let voxel = readVoxel(at: offset) else {
+                    offset += voxelStride
+                    continue
+                }
+                offset += voxelStride
+                guard i % sampleStride == 0 else { continue }
+                let p = transformedPoint(
+                    Double(voxel.positionAndConfidence.x),
+                    Double(voxel.positionAndConfidence.y),
+                    Double(voxel.positionAndConfidence.z)
+                )
+                samples.append(ReportPreviewPoint(position: p, color: voxelColor(voxel)))
+                if samples.count >= targetCount { break }
+            }
+        } else if data.count == voxelBuffer.length {
+            let total = data.count / voxelStride
+            let sampleStride = max(1, total / targetCount)
+            var recordIndex = 0
+            for offset in stride(from: 0, to: data.count, by: voxelStride) {
+                if isCancelled?() == true { return nil }
+                defer { recordIndex += 1 }
+                guard recordIndex % sampleStride == 0 else { continue }
+                guard let voxel = readVoxel(at: offset), voxel.colorAndSampleCount.w > 0 else { continue }
+                let p = transformedPoint(
+                    Double(voxel.positionAndConfidence.x),
+                    Double(voxel.positionAndConfidence.y),
+                    Double(voxel.positionAndConfidence.z)
+                )
+                samples.append(ReportPreviewPoint(position: p, color: voxelColor(voxel)))
+                if samples.count >= targetCount { break }
+            }
+        } else {
+            return nil
+        }
+
+        return samples.isEmpty ? nil : samples
+    }
+
+    private func makeReportPreviewPanelImage(
+        points: [ReportPreviewPoint],
+        measurements: [ScanReportMeasurement],
+        exportFormat: ExportFormat,
+        captureMetadata: ScanCaptureMetadata?,
+        style: ReportPreviewStyle,
+    ) -> UIImage? {
+        let crsContext = exportFormat == .laz ? makeApproximateCRSContext(captureMetadata: captureMetadata) : nil
+        func transformedMeasurementVertex(_ vertex: ScanReportVertex) -> SIMD3<Double> {
+            if let crsContext {
+                let t = crsContext.transform(localX: vertex.x, localY: vertex.y, localZ: vertex.z)
+                return SIMD3<Double>(t.x, t.y, t.z)
+            }
+            return SIMD3<Double>(vertex.x, vertex.y, vertex.z)
+        }
+
+        let measurementPaths3D: [[SIMD3<Double>]] = measurements
+            .filter { $0.vertices.count >= 2 }
+            .map { measurement in
+                measurement.vertices.map(transformedMeasurementVertex(_:))
+            }
+        let measurementTypes = measurements.filter { $0.vertices.count >= 2 }.map(\.type)
+
+        let minElevation = points.map(\.position.y).min() ?? 0
+        let maxElevation = points.map(\.position.y).max() ?? 1
+        let elevationSpan = max(maxElevation - minElevation, 0.001)
+
+        func elevationColor(_ y: Double) -> UIColor {
+            let t = max(0.0, min(1.0, (y - minElevation) / elevationSpan))
+            let hue = CGFloat((0.67 - (0.67 * t)))
+            return UIColor(hue: hue, saturation: 0.88, brightness: 0.90, alpha: 1.0)
+        }
+
+        func measurementColor(_ index: Int) -> UIColor {
+            let hue = CGFloat((index % 8)) / 8.0
+            return UIColor(hue: hue, saturation: 0.9, brightness: 0.85, alpha: 1.0)
+        }
+
+        let imageSize = CGSize(width: 960, height: 700)
+        let renderer = UIGraphicsImageRenderer(size: imageSize)
+        return renderer.image { context in
+            let cg = context.cgContext
+            cg.setFillColor(UIColor.white.cgColor)
+            cg.fill(CGRect(origin: .zero, size: imageSize))
+
+            let outerMargin: CGFloat = 20
+            let panelGap: CGFloat = 10
+            let titleBand: CGFloat = 20
+            let content = CGRect(
+                x: outerMargin,
+                y: outerMargin,
+                width: imageSize.width - outerMargin * 2,
+                height: imageSize.height - outerMargin * 2
+            )
+
+            let panelW = (content.width - panelGap) / 2
+            let panelH = (content.height - panelGap) / 2
+            let views = ReportPreviewViewKind.allCases
+
+            for (index, viewKind) in views.enumerated() {
+                let row = index / 2
+                let col = index % 2
+                let origin = CGPoint(
+                    x: content.minX + CGFloat(col) * (panelW + panelGap),
+                    y: content.minY + CGFloat(row) * (panelH + panelGap)
+                )
+                let panelRect = CGRect(origin: origin, size: CGSize(width: panelW, height: panelH))
+                let drawingRect = panelRect.insetBy(dx: 8, dy: 8 + titleBand)
+
+                cg.setFillColor(UIColor(white: 0.985, alpha: 1.0).cgColor)
+                cg.fill(panelRect)
+                cg.setStrokeColor(UIColor(white: 0.82, alpha: 1.0).cgColor)
+                cg.setLineWidth(0.9)
+                cg.stroke(panelRect)
+
+                NSString(string: viewKind.title).draw(
+                    in: CGRect(x: panelRect.minX + 8, y: panelRect.minY + 5, width: panelRect.width - 16, height: 14),
+                    withAttributes: [
+                        .font: UIFont.systemFont(ofSize: 10, weight: .semibold),
+                        .foregroundColor: UIColor.darkGray
+                    ]
+                )
+
+                let projectedPoints = points.map { (p: viewKind.project($0.position), color: $0.color, elevation: $0.position.y) }
+                var projectedMeasurementPaths: [[CGPoint]] = []
+                projectedMeasurementPaths.reserveCapacity(measurementPaths3D.count)
+                for path in measurementPaths3D {
+                    projectedMeasurementPaths.append(path.map { viewKind.project($0) })
+                }
+
+                var minX = Double.greatestFiniteMagnitude
+                var minY = Double.greatestFiniteMagnitude
+                var maxX = -Double.greatestFiniteMagnitude
+                var maxY = -Double.greatestFiniteMagnitude
+
+                for point in projectedPoints {
+                    minX = min(minX, point.p.x)
+                    minY = min(minY, point.p.y)
+                    maxX = max(maxX, point.p.x)
+                    maxY = max(maxY, point.p.y)
+                }
+                for path in projectedMeasurementPaths {
+                    for p in path {
+                        minX = min(minX, p.x)
+                        minY = min(minY, p.y)
+                        maxX = max(maxX, p.x)
+                        maxY = max(maxY, p.y)
+                    }
+                }
+                guard minX.isFinite, minY.isFinite, maxX.isFinite, maxY.isFinite else { continue }
+                let spanX = max(maxX - minX, 0.001)
+                let spanY = max(maxY - minY, 0.001)
+
+                func map(_ p: CGPoint) -> CGPoint {
+                    let nx = (p.x - minX) / spanX
+                    let ny = (p.y - minY) / spanY
+                    return CGPoint(
+                        x: drawingRect.minX + (CGFloat(nx) * drawingRect.width),
+                        y: drawingRect.maxY - (CGFloat(ny) * drawingRect.height)
+                    )
+                }
+
+                for point in projectedPoints {
+                    let mapped = map(point.p)
+                    let color: UIColor = {
+                        switch style {
+                        case .rgb:
+                            return point.color.withAlphaComponent(0.42)
+                        case .elevation:
+                            return elevationColor(point.elevation).withAlphaComponent(0.45)
+                        }
+                    }()
+                    cg.setFillColor(color.cgColor)
+                    cg.fillEllipse(in: CGRect(x: mapped.x - 0.8, y: mapped.y - 0.8, width: 1.6, height: 1.6))
+                }
+
+                for (idx, path) in projectedMeasurementPaths.enumerated() where path.count >= 2 {
+                    let color = measurementColor(idx)
+                    cg.setStrokeColor(color.cgColor)
+                    cg.setLineWidth(1.8)
+                    cg.beginPath()
+                    cg.move(to: map(path[0]))
+                    for p in path.dropFirst() {
+                        cg.addLine(to: map(p))
+                    }
+                    if measurementTypes[idx] == .closedArea {
+                        cg.closePath()
+                    }
+                    cg.strokePath()
+
+                    cg.setFillColor(color.cgColor)
+                    for p in path {
+                        let mp = map(p)
+                        cg.fillEllipse(in: CGRect(x: mp.x - 1.9, y: mp.y - 1.9, width: 3.8, height: 3.8))
+                    }
+                }
+            }
+
+            let legendCount = min(measurementPaths3D.count, 8)
+            if legendCount > 0 {
+                let legendRect = CGRect(x: content.maxX - 178, y: content.minY + 6, width: 170, height: CGFloat(28 + (legendCount * 14)))
+                cg.setFillColor(UIColor.white.withAlphaComponent(0.90).cgColor)
+                cg.fill(legendRect)
+                cg.setStrokeColor(UIColor(white: 0.76, alpha: 1.0).cgColor)
+                cg.setLineWidth(0.8)
+                cg.stroke(legendRect)
+
+                NSString(string: "Legend").draw(
+                    in: CGRect(x: legendRect.minX + 8, y: legendRect.minY + 5, width: legendRect.width - 16, height: 12),
+                    withAttributes: [
+                        .font: UIFont.systemFont(ofSize: 9, weight: .semibold),
+                        .foregroundColor: UIColor.black
+                    ]
+                )
+
+                for i in 0..<legendCount {
+                    let y = legendRect.minY + 18 + CGFloat(i) * 14
+                    let color = measurementColor(i)
+                    cg.setFillColor(color.cgColor)
+                    cg.fill(CGRect(x: legendRect.minX + 8, y: y + 2, width: 8, height: 8))
+                    let typeLabel: String = {
+                        switch measurementTypes[i] {
+                        case .distance: return "Distance"
+                        case .polyline: return "Polyline"
+                        case .closedArea: return "Area"
+                        case .crossSection: return "Cross"
+                        case .elevationProfile: return "Elev"
+                        }
+                    }()
+                    NSString(string: "M\(i + 1)  \(typeLabel)").draw(
+                        in: CGRect(x: legendRect.minX + 22, y: y, width: legendRect.width - 28, height: 12),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: 8.4, weight: .regular),
+                            .foregroundColor: UIColor.black
+                        ]
+                    )
+                }
+            }
+
+            if style == .elevation {
+                let gradRect = CGRect(x: content.minX + 8, y: content.maxY - 20, width: 180, height: 10)
+                let colors = stride(from: 0.0, through: 1.0, by: 0.05).map { elevationColor(minElevation + ($0 * elevationSpan)).cgColor } as CFArray
+                if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: nil) {
+                    cg.saveGState()
+                    cg.clip(to: gradRect)
+                    cg.drawLinearGradient(gradient, start: CGPoint(x: gradRect.minX, y: gradRect.midY), end: CGPoint(x: gradRect.maxX, y: gradRect.midY), options: [])
+                    cg.restoreGState()
+                }
+                cg.setStrokeColor(UIColor(white: 0.7, alpha: 1.0).cgColor)
+                cg.stroke(gradRect)
+                NSString(string: "Low").draw(
+                    in: CGRect(x: gradRect.minX, y: gradRect.maxY + 1, width: 40, height: 10),
+                    withAttributes: [.font: UIFont.systemFont(ofSize: 8), .foregroundColor: UIColor.darkGray]
+                )
+                NSString(string: "High").draw(
+                    in: CGRect(x: gradRect.maxX - 34, y: gradRect.maxY + 1, width: 34, height: 10),
+                    withAttributes: [.font: UIFont.systemFont(ofSize: 8), .foregroundColor: UIColor.darkGray]
+                )
+            }
+        }
+    }
+
+    private struct ProfileSamplePoint {
+        let distance: Double
+        let elevation: Double
+    }
+
+    private struct MeasurementSectionPoint {
+        let x: Double
+        let y: Double
+        let color: UIColor
+    }
+
+    private struct MeasurementPointCloudAnalysis {
+        let profileSamples: [ProfileSamplePoint]
+        let sectionScatter: [MeasurementSectionPoint]
+        let sourcePointCount: Int
+        let corridorPointCount: Int
+        let profileBinWidthMeters: Double?
+        let stationWindowMeters: Double?
+        let profileLength: Double?
+        let minElevation: Double?
+        let maxElevation: Double?
+        let relief: Double?
+        let totalRise: Double?
+        let totalFall: Double?
+        let averageSlopePercent: Double?
+        let maxSlopePercent: Double?
+    }
+
+    private func buildMeasurementAnalyses(
+        measurements: [ScanReportMeasurement],
+        cloudPoints: [ReportPreviewPoint],
+        exportFormat: ExportFormat,
+        captureMetadata: ScanCaptureMetadata?
+    ) -> [String: MeasurementPointCloudAnalysis] {
+        let crsContext = exportFormat == .laz ? makeApproximateCRSContext(captureMetadata: captureMetadata) : nil
+        let useProjectedAxes = (crsContext != nil)
+
+        func transformedVertex(_ vertex: ScanReportVertex) -> SIMD3<Double> {
+            if let crsContext {
+                let t = crsContext.transform(localX: vertex.x, localY: vertex.y, localZ: vertex.z)
+                return SIMD3<Double>(t.x, t.y, t.z)
+            }
+            return SIMD3<Double>(vertex.x, vertex.y, vertex.z)
+        }
+
+        func horizontal(_ p: SIMD3<Double>) -> SIMD2<Double> {
+            useProjectedAxes ? SIMD2<Double>(p.x, p.y) : SIMD2<Double>(p.x, p.z)
+        }
+
+        func elevation(_ p: SIMD3<Double>) -> Double {
+            useProjectedAxes ? p.z : p.y
+        }
+
+        struct SegmentInfo {
+            let a: SIMD2<Double>
+            let v: SIMD2<Double>
+            let len: Double
+            let invLen2: Double
+            let startDistance: Double
+        }
+
+        struct CorridorPoint {
+            let alongDistance: Double
+            let lateralDistanceSigned: Double
+            let elevation: Double
+            let color: UIColor
+        }
+
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            if sorted.isEmpty { return 0 }
+            if sorted.count % 2 == 1 { return sorted[sorted.count / 2] }
+            return (sorted[(sorted.count / 2) - 1] + sorted[sorted.count / 2]) * 0.5
+        }
+
+        func percentile(_ values: [Double], fraction: Double) -> Double {
+            let sorted = values.sorted()
+            guard !sorted.isEmpty else { return 0 }
+            let p = max(0.0, min(1.0, fraction))
+            let idx = Int(round(p * Double(sorted.count - 1)))
+            return sorted[max(0, min(sorted.count - 1, idx))]
+        }
+
+        func fillMissing(_ values: inout [Double?]) {
+            guard let firstValid = values.firstIndex(where: { $0 != nil }) else { return }
+            for idx in 0..<firstValid {
+                values[idx] = values[firstValid]
+            }
+            var lastKnown = firstValid
+            for idx in (firstValid + 1)..<values.count {
+                if values[idx] != nil {
+                    let start = lastKnown
+                    let end = idx
+                    let gap = end - start
+                    if gap > 1, let startValue = values[start], let endValue = values[end] {
+                        for g in 1..<gap {
+                            let t = Double(g) / Double(gap)
+                            values[start + g] = startValue + ((endValue - startValue) * t)
+                        }
+                    }
+                    lastKnown = idx
+                }
+            }
+            for idx in (lastKnown + 1)..<values.count {
+                values[idx] = values[lastKnown]
+            }
+        }
+
+        func smoothSeries(_ values: [Double], radius: Int) -> [Double] {
+            guard !values.isEmpty, radius > 0 else { return values }
+            var result = values
+            for idx in values.indices {
+                var weightedSum = 0.0
+                var weightTotal = 0.0
+                let start = max(values.startIndex, idx - radius)
+                let end = min(values.endIndex - 1, idx + radius)
+                for sampleIdx in start...end {
+                    let offset = abs(sampleIdx - idx)
+                    let weight = Double(radius - offset + 1)
+                    weightedSum += values[sampleIdx] * weight
+                    weightTotal += weight
+                }
+                result[idx] = weightTotal > 0 ? (weightedSum / weightTotal) : values[idx]
+            }
+            return result
+        }
+
+        func fallbackProfile(vertices: [SIMD3<Double>]) -> [ProfileSamplePoint] {
+            guard vertices.count >= 2 else { return [] }
+            var result: [ProfileSamplePoint] = [ProfileSamplePoint(distance: 0, elevation: elevation(vertices[0]))]
+            var total: Double = 0
+            for idx in 1..<vertices.count {
+                let hA = horizontal(vertices[idx - 1])
+                let hB = horizontal(vertices[idx])
+                total += simd_length(hB - hA)
+                result.append(ProfileSamplePoint(distance: total, elevation: elevation(vertices[idx])))
+            }
+            return result
+        }
+
+        func stats(from profile: [ProfileSamplePoint]) -> (
+            length: Double?,
+            minElevation: Double?,
+            maxElevation: Double?,
+            relief: Double?,
+            rise: Double?,
+            fall: Double?,
+            avgSlope: Double?,
+            maxSlope: Double?
+        ) {
+            guard profile.count >= 2 else {
+                return (nil, nil, nil, nil, nil, nil, nil, nil)
+            }
+            let elevations = profile.map(\.elevation)
+            guard let minE = elevations.min(), let maxE = elevations.max() else {
+                return (nil, nil, nil, nil, nil, nil, nil, nil)
+            }
+
+            var rise = 0.0
+            var fall = 0.0
+            var maxSlope = 0.0
+            var totalDistance = 0.0
+            var totalAbsDelta = 0.0
+            for idx in 1..<profile.count {
+                let d = profile[idx].distance - profile[idx - 1].distance
+                guard d > 1e-6 else { continue }
+                let dz = profile[idx].elevation - profile[idx - 1].elevation
+                if dz >= 0 {
+                    rise += dz
+                } else {
+                    fall += abs(dz)
+                }
+                totalDistance += d
+                totalAbsDelta += abs(dz)
+                maxSlope = max(maxSlope, abs(dz / d) * 100.0)
+            }
+            let avgSlope = totalDistance > 1e-6 ? (totalAbsDelta / totalDistance * 100.0) : 0.0
+            let length = profile.last!.distance - profile.first!.distance
+            return (length, minE, maxE, max(0, maxE - minE), rise, fall, avgSlope, maxSlope)
+        }
+
+        func analyze(measurement: ScanReportMeasurement, path: [SIMD3<Double>]) -> MeasurementPointCloudAnalysis? {
+            guard path.count >= 2 else { return nil }
+
+            var segments: [SegmentInfo] = []
+            segments.reserveCapacity(path.count - 1)
+            var cumulativeDistance = 0.0
+            for idx in 1..<path.count {
+                let a = horizontal(path[idx - 1])
+                let b = horizontal(path[idx])
+                let v = b - a
+                let len = simd_length(v)
+                guard len > 1e-6 else { continue }
+                segments.append(SegmentInfo(a: a, v: v, len: len, invLen2: 1.0 / simd_length_squared(v), startDistance: cumulativeDistance))
+                cumulativeDistance += len
+            }
+            guard !segments.isEmpty, cumulativeDistance > 1e-6 else { return nil }
+
+            let crossSwath = max(0.04, measurement.swathWidthMeters ?? 0.12)
+            let profileSwath = measurement.type == .crossSection ? crossSwath : max(crossSwath, 0.12)
+            let profileHalf = profileSwath * 0.5
+            let sectionHalfWindow = max(0.06, min(1.2, crossSwath * 0.9))
+            let sectionMid = cumulativeDistance * 0.5
+
+            var corridorPoints: [CorridorPoint] = []
+            corridorPoints.reserveCapacity(10_000)
+
+            for sample in cloudPoints {
+                let point = sample.position
+                let hPoint = horizontal(point)
+                let pointElevation = elevation(point)
+                var bestDistance = Double.greatestFiniteMagnitude
+                var bestAlong = 0.0
+                var bestSigned = 0.0
+
+                for segment in segments {
+                    let w = hPoint - segment.a
+                    let rawT = simd_dot(w, segment.v) * segment.invLen2
+                    let t = max(0.0, min(1.0, rawT))
+                    let projected = segment.a + (segment.v * t)
+                    let delta = hPoint - projected
+                    let lateralDistance = simd_length(delta)
+                    if lateralDistance < bestDistance {
+                        bestDistance = lateralDistance
+                        bestAlong = segment.startDistance + (t * segment.len)
+                        let cross = (segment.v.x * w.y) - (segment.v.y * w.x)
+                        let sign = cross >= 0 ? 1.0 : -1.0
+                        bestSigned = lateralDistance * sign
+                    }
+                }
+
+                if bestDistance <= profileHalf {
+                    corridorPoints.append(CorridorPoint(
+                        alongDistance: bestAlong,
+                        lateralDistanceSigned: bestSigned,
+                        elevation: pointElevation,
+                        color: sample.color
+                    ))
+                }
+            }
+
+            var profile: [ProfileSamplePoint] = []
+            var profileBinWidth: Double?
+            if !corridorPoints.isEmpty {
+                let targetBinWidth = max(0.01, min(0.05, profileSwath * 0.35))
+                let desiredSamples = max(32, min(420, Int(ceil(cumulativeDistance / targetBinWidth)) + 1))
+                let binCount = max(2, desiredSamples)
+                let binWidth = cumulativeDistance / Double(binCount - 1)
+                profileBinWidth = binWidth
+                var bins = Array(repeating: [Double](), count: binCount)
+                bins.withUnsafeMutableBufferPointer { binsBuffer in
+                    for sample in corridorPoints {
+                        let idx = max(0, min(binCount - 1, Int(floor(sample.alongDistance / max(binWidth, 1e-6)))))
+                        binsBuffer[idx].append(sample.elevation)
+                    }
+                }
+                var binElevations = Array<Double?>(repeating: nil, count: binCount)
+                for idx in 0..<binCount where !bins[idx].isEmpty {
+                    if measurement.type == .elevationProfile {
+                        binElevations[idx] = percentile(bins[idx], fraction: 0.35)
+                    } else {
+                        binElevations[idx] = median(bins[idx])
+                    }
+                }
+                fillMissing(&binElevations)
+                if binElevations.contains(where: { $0 != nil }) {
+                    var values = binElevations.map { $0 ?? 0 }
+                    if measurement.type == .elevationProfile {
+                        values = smoothSeries(values, radius: 2)
+                        values = smoothSeries(values, radius: 2)
+                    }
+                    for idx in 0..<binCount {
+                        profile.append(ProfileSamplePoint(distance: Double(idx) * binWidth, elevation: values[idx]))
+                    }
+                }
+            }
+            if profile.count < 2 {
+                profile = fallbackProfile(vertices: path)
+                if profile.count >= 2 {
+                    profileBinWidth = max(1e-6, cumulativeDistance / Double(profile.count - 1))
+                }
+            }
+
+            let sectionScatter: [MeasurementSectionPoint] = measurement.type == .crossSection
+                ? corridorPoints.filter {
+                    abs($0.alongDistance - sectionMid) <= sectionHalfWindow && abs($0.lateralDistanceSigned) <= (crossSwath * 0.5)
+                }.map {
+                    MeasurementSectionPoint(x: $0.lateralDistanceSigned, y: $0.elevation, color: $0.color)
+                }
+                : []
+
+            let s = stats(from: profile)
+            return MeasurementPointCloudAnalysis(
+                profileSamples: profile,
+                sectionScatter: sectionScatter,
+                sourcePointCount: cloudPoints.count,
+                corridorPointCount: corridorPoints.count,
+                profileBinWidthMeters: profileBinWidth,
+                stationWindowMeters: sectionHalfWindow * 2.0,
+                profileLength: s.length,
+                minElevation: s.minElevation,
+                maxElevation: s.maxElevation,
+                relief: s.relief,
+                totalRise: s.rise,
+                totalFall: s.fall,
+                averageSlopePercent: s.avgSlope,
+                maxSlopePercent: s.maxSlope
+            )
+        }
+
+        var result: [String: MeasurementPointCloudAnalysis] = [:]
+        for measurement in measurements where measurement.type == .crossSection || measurement.type == .elevationProfile {
+            let transformedPath = measurement.vertices.map(transformedVertex(_:))
+            if let analysis = analyze(measurement: measurement, path: transformedPath) {
+                result[measurement.id] = analysis
+            }
+        }
+        return result
+    }
+
+    private func makeMeasurementGraphImage(
+        measurement: ScanReportMeasurement,
+        analysis: MeasurementPointCloudAnalysis?,
+        title: String,
+        lineColor: UIColor
+    ) -> UIImage? {
+        guard measurement.vertices.count >= 2 else { return nil }
+
+        let size = CGSize(width: 900, height: 260)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { context in
+            let cg = context.cgContext
+            let rect = CGRect(origin: .zero, size: size)
+            cg.setFillColor(UIColor.white.cgColor)
+            cg.fill(rect)
+            cg.setStrokeColor(UIColor(white: 0.84, alpha: 1).cgColor)
+            cg.setLineWidth(0.8)
+            cg.stroke(rect.insetBy(dx: 0.5, dy: 0.5))
+
+            let chartRect = CGRect(x: 54, y: 28, width: size.width - 78, height: size.height - 66)
+
+            cg.setStrokeColor(UIColor(white: 0.9, alpha: 1.0).cgColor)
+            cg.setLineWidth(0.8)
+            for i in 0...4 {
+                let t = CGFloat(i) / 4.0
+                let y = chartRect.minY + t * chartRect.height
+                cg.move(to: CGPoint(x: chartRect.minX, y: y))
+                cg.addLine(to: CGPoint(x: chartRect.maxX, y: y))
+                cg.strokePath()
+            }
+
+            NSString(string: title).draw(
+                in: CGRect(x: 10, y: 8, width: size.width - 20, height: 16),
+                withAttributes: [
+                    .font: UIFont.systemFont(ofSize: 11, weight: .semibold),
+                    .foregroundColor: UIColor.black
+                ]
+            )
+
+            if measurement.type == .crossSection, let analysis, analysis.sectionScatter.count >= 4 {
+                let xs = analysis.sectionScatter.map(\.x)
+                let ys = analysis.sectionScatter.map(\.y)
+                guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return }
+                let spanX = max(maxX - minX, 0.001)
+                let spanY = max(maxY - minY, 0.001)
+                func map(_ point: MeasurementSectionPoint) -> CGPoint {
+                    let nx = (point.x - minX) / spanX
+                    let ny = (point.y - minY) / spanY
+                    return CGPoint(
+                        x: chartRect.minX + CGFloat(nx) * chartRect.width,
+                        y: chartRect.maxY - CGFloat(ny) * chartRect.height
+                    )
+                }
+                for point in analysis.sectionScatter {
+                    let p = map(point)
+                    cg.setFillColor(point.color.withAlphaComponent(0.82).cgColor)
+                    cg.fillEllipse(in: CGRect(x: p.x - 1.5, y: p.y - 1.5, width: 3.0, height: 3.0))
+                }
+                let axisAttrs: [NSAttributedString.Key: Any] = [
+                    .font: UIFont.systemFont(ofSize: 8, weight: .regular),
+                    .foregroundColor: UIColor.darkGray
+                ]
+                NSString(string: String(format: "%.2f m", minY)).draw(in: CGRect(x: 4, y: chartRect.maxY - 6, width: 46, height: 12), withAttributes: axisAttrs)
+                NSString(string: String(format: "%.2f m", maxY)).draw(in: CGRect(x: 4, y: chartRect.minY - 6, width: 46, height: 12), withAttributes: axisAttrs)
+                NSString(string: String(format: "%.2f", minX)).draw(in: CGRect(x: chartRect.minX - 2, y: chartRect.maxY + 2, width: 40, height: 12), withAttributes: axisAttrs)
+                NSString(string: String(format: "%.2f", maxX)).draw(in: CGRect(x: chartRect.maxX - 40, y: chartRect.maxY + 2, width: 40, height: 12), withAttributes: axisAttrs)
+                return
+            }
+
+            var profile = analysis?.profileSamples ?? []
+            if profile.count < 2 {
+                var distances: [Double] = [0]
+                distances.reserveCapacity(measurement.vertices.count)
+                var totalDistance = 0.0
+                for idx in 1..<measurement.vertices.count {
+                    let a = measurement.vertices[idx - 1]
+                    let b = measurement.vertices[idx]
+                    let dx = b.x - a.x
+                    let dy = b.y - a.y
+                    let dz = b.z - a.z
+                    totalDistance += sqrt(dx * dx + dy * dy + dz * dz)
+                    distances.append(totalDistance)
+                }
+                profile = measurement.vertices.enumerated().map {
+                    ProfileSamplePoint(distance: distances[$0.offset], elevation: $0.element.y)
+                }
+            }
+            guard profile.count >= 2 else { return }
+
+            let minElevation = profile.map(\.elevation).min() ?? 0
+            let maxElevation = profile.map(\.elevation).max() ?? 1
+            let spanY = max(maxElevation - minElevation, 0.001)
+            let totalDistance = max(profile.last!.distance - profile.first!.distance, 0.001)
+
+            func map(_ sample: ProfileSamplePoint) -> CGPoint {
+                let nx = (sample.distance - profile.first!.distance) / totalDistance
+                let ny = (sample.elevation - minElevation) / spanY
+                return CGPoint(
+                    x: chartRect.minX + CGFloat(nx) * chartRect.width,
+                    y: chartRect.maxY - CGFloat(ny) * chartRect.height
+                )
+            }
+
+            let fillPath = UIBezierPath()
+            let linePath = UIBezierPath()
+            let first = map(profile[0])
+            fillPath.move(to: CGPoint(x: first.x, y: chartRect.maxY))
+            fillPath.addLine(to: first)
+            linePath.move(to: first)
+            for sample in profile.dropFirst() {
+                let p = map(sample)
+                fillPath.addLine(to: p)
+                linePath.addLine(to: p)
+            }
+            if let last = linePath.currentPoint as CGPoint? {
+                fillPath.addLine(to: CGPoint(x: last.x, y: chartRect.maxY))
+                fillPath.close()
+            }
+
+            lineColor.withAlphaComponent(0.15).setFill()
+            fillPath.fill()
+            lineColor.setStroke()
+            linePath.lineWidth = 2.0
+            linePath.stroke()
+
+            let axisAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 8, weight: .regular),
+                .foregroundColor: UIColor.darkGray
+            ]
+            NSString(string: String(format: "%.2f m", minElevation)).draw(in: CGRect(x: 4, y: chartRect.maxY - 6, width: 46, height: 12), withAttributes: axisAttrs)
+            NSString(string: String(format: "%.2f m", maxElevation)).draw(in: CGRect(x: 4, y: chartRect.minY - 6, width: 46, height: 12), withAttributes: axisAttrs)
+            NSString(string: "0m").draw(in: CGRect(x: chartRect.minX - 2, y: chartRect.maxY + 2, width: 30, height: 12), withAttributes: axisAttrs)
+            NSString(string: String(format: "%.2fm", totalDistance)).draw(in: CGRect(x: chartRect.maxX - 40, y: chartRect.maxY + 2, width: 40, height: 12), withAttributes: axisAttrs)
+        }
+    }
+
+    private struct ExportCRSContext {
+        let epsg: Int
+        let crsName: String
+        let wkt: String
+        let originLatitude: Double
+        let originLongitude: Double
+        let originAltitude: Double
+        let originEasting: Double
+        let originNorthing: Double
+        let headingDegrees: Double?
+        let note: String
+
+        func transform(localX: Double, localY: Double, localZ: Double) -> (x: Double, y: Double, z: Double) {
+            let eastLocal = localX
+            let northLocal = -localZ
+
+            let east: Double
+            let north: Double
+            if let headingDegrees {
+                let h = headingDegrees * .pi / 180.0
+                east = (eastLocal * cos(h)) + (northLocal * sin(h))
+                north = (-eastLocal * sin(h)) + (northLocal * cos(h))
+            } else {
+                east = eastLocal
+                north = northLocal
+            }
+
+            return (
+                originEasting + east,
+                originNorthing + north,
+                originAltitude + localY
+            )
+        }
+    }
+
+    private func makeApproximateCRSContext(captureMetadata: ScanCaptureMetadata?) -> ExportCRSContext? {
+        guard let location = captureMetadata?.location else { return nil }
+        let lat = location.latitude
+        let lon = location.longitude
+        guard lat.isFinite, lon.isFinite else { return nil }
+        guard abs(lat) <= 84.0, abs(lon) <= 180.0 else { return nil }
+
+        let zone = max(1, min(60, Int(floor((lon + 180.0) / 6.0)) + 1))
+        let isNorth = lat >= 0
+        let epsg = (isNorth ? 32600 : 32700) + zone
+        let falseNorthing = isNorth ? 0.0 : 10_000_000.0
+        let hemisphereSuffix = isNorth ? "N" : "S"
+        let centralMeridian = Double(zone * 6 - 183)
+        let crsName = "WGS 84 / UTM zone \(zone)\(hemisphereSuffix)"
+        let wkt = """
+        PROJCS["\(crsName)",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",\(centralMeridian)],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",\(falseNorthing)],UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","\(epsg)"]]
+        """
+
+        guard let utmOrigin = latLonToUTM(latitude: lat, longitude: lon, zone: zone, isNorthernHemisphere: isNorth) else {
+            return nil
+        }
+
+        let heading = location.headingDegrees.flatMap { value -> Double? in
+            guard value.isFinite else { return nil }
+            let normalized = value.truncatingRemainder(dividingBy: 360.0)
+            return normalized >= 0 ? normalized : (normalized + 360.0)
+        }
+        let note = heading != nil ?
+            "Approximate georeferencing anchored by device GPS and heading." :
+            "Approximate georeferencing anchored by device GPS; orientation uses local AR frame."
+
+        return ExportCRSContext(
+            epsg: epsg,
+            crsName: crsName,
+            wkt: wkt,
+            originLatitude: lat,
+            originLongitude: lon,
+            originAltitude: location.altitude,
+            originEasting: utmOrigin.easting,
+            originNorthing: utmOrigin.northing,
+            headingDegrees: heading,
+            note: note
+        )
+    }
+
+    private func latLonToUTM(
+        latitude: Double,
+        longitude: Double,
+        zone: Int,
+        isNorthernHemisphere: Bool
+    ) -> (easting: Double, northing: Double)? {
+        let a = 6_378_137.0
+        let f = 1.0 / 298.257_223_563
+        let k0 = 0.9996
+        let e2 = f * (2 - f)
+        let ePrime2 = e2 / (1 - e2)
+
+        let latRad = latitude * .pi / 180.0
+        let lonRad = longitude * .pi / 180.0
+        let lonOrigin = Double(zone * 6 - 183) * .pi / 180.0
+
+        let sinLat = sin(latRad)
+        let cosLat = cos(latRad)
+        let tanLat = tan(latRad)
+
+        let n = a / sqrt(1 - e2 * sinLat * sinLat)
+        let t = tanLat * tanLat
+        let c = ePrime2 * cosLat * cosLat
+        let aTerm = cosLat * (lonRad - lonOrigin)
+
+        let m = a * (
+            (1 - e2 / 4 - 3 * e2 * e2 / 64 - 5 * pow(e2, 3) / 256) * latRad
+            - (3 * e2 / 8 + 3 * e2 * e2 / 32 + 45 * pow(e2, 3) / 1024) * sin(2 * latRad)
+            + (15 * e2 * e2 / 256 + 45 * pow(e2, 3) / 1024) * sin(4 * latRad)
+            - (35 * pow(e2, 3) / 3072) * sin(6 * latRad)
+        )
+
+        let easting = k0 * n * (
+            aTerm
+            + (1 - t + c) * pow(aTerm, 3) / 6
+            + (5 - 18 * t + t * t + 72 * c - 58 * ePrime2) * pow(aTerm, 5) / 120
+        ) + 500_000.0
+
+        var northing = k0 * (
+            m
+            + n * tanLat * (
+                aTerm * aTerm / 2
+                + (5 - t + 9 * c + 4 * c * c) * pow(aTerm, 4) / 24
+                + (61 - 58 * t + t * t + 600 * c - 330 * ePrime2) * pow(aTerm, 6) / 720
+            )
+        )
+
+        if !isNorthernHemisphere {
+            northing += 10_000_000.0
+        }
+
+        guard easting.isFinite, northing.isFinite else { return nil }
+        return (easting, northing)
+    }
+
+    private func writeLAZ(
+        to url: URL,
+        fromSnapshot data: Data,
+        pointCount: Int,
+        captureMetadata: ScanCaptureMetadata?,
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> LAZWriteResult? {
+        let voxelStride = MemoryLayout<Voxel>.stride
+        let headerSize = MemoryLayout<UInt32>.size * 3
+        let recordSize = MemoryLayout<UInt32>.size + voxelStride
+        let progressUpdateStride = 8_192
+
+        func readUInt32(at offset: Int) -> UInt32? {
+            guard offset + MemoryLayout<UInt32>.size <= data.count else { return nil }
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + MemoryLayout<UInt32>.size))
+            }
+            return value
+        }
+
+        func readVoxel(at offset: Int) -> Voxel? {
+            guard offset + voxelStride <= data.count else { return nil }
+            var voxel = Voxel(positionAndConfidence: .zero, colorAndSampleCount: .zero)
+            _ = withUnsafeMutableBytes(of: &voxel) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + voxelStride))
+            }
+            return voxel
+        }
+
+        func clampedColor16(_ value: Float) -> UInt16 {
+            let scaled8 = value <= 1.0 ? value * 255.0 : value
+            let clamped8 = max(0, min(255, Int(scaled8.rounded())))
+            return UInt16(clamped8 * 257)
+        }
+
+        func intensityFromConfidence(_ value: Float) -> UInt16 {
+            let normalized = value <= 1.0 ? value : min(1.0, value / 255.0)
+            let scaled = max(0.0, min(1.0, Double(normalized))) * 65535.0
+            return UInt16(scaled.rounded())
+        }
+
+        let isCompact = data.count >= headerSize &&
+            readUInt32(at: 0) == 0x50435331 &&
+            readUInt32(at: 1 * MemoryLayout<UInt32>.size) == 1
+        let crsContext = makeApproximateCRSContext(captureMetadata: captureMetadata)
+
+        func transformedPoint(_ voxel: Voxel) -> (x: Double, y: Double, z: Double) {
+            let px = Double(voxel.positionAndConfidence.x)
+            let py = Double(voxel.positionAndConfidence.y)
+            let pz = Double(voxel.positionAndConfidence.z)
+            if let crsContext {
+                return crsContext.transform(localX: px, localY: py, localZ: pz)
+            }
+            return (px, py, pz)
+        }
+
+        var compactRecordCount = 0
+        var vertexCount = 0
+        var minX = Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var minZ = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        var maxZ = -Double.greatestFiniteMagnitude
+
+        if isCompact, let storedCount = readUInt32(at: 2 * MemoryLayout<UInt32>.size) {
+            compactRecordCount = min(Int(storedCount), max(0, (data.count - headerSize) / recordSize))
+            var offset = headerSize
+            for i in 0..<compactRecordCount {
+                if isCancelled?() == true { return nil }
+                guard offset + recordSize <= data.count else { break }
+                let idx = readUInt32(at: offset) ?? UInt32.max
+                offset += MemoryLayout<UInt32>.size
+                guard idx < UInt32(maxVoxels), let voxel = readVoxel(at: offset) else {
+                    offset += voxelStride
+                    continue
+                }
+                offset += voxelStride
+                let projected = transformedPoint(voxel)
+                minX = min(minX, projected.x)
+                minY = min(minY, projected.y)
+                minZ = min(minZ, projected.z)
+                maxX = max(maxX, projected.x)
+                maxY = max(maxY, projected.y)
+                maxZ = max(maxZ, projected.z)
+                vertexCount += 1
+                if i % progressUpdateStride == 0 {
+                    let fraction = compactRecordCount > 0 ? Double(i) / Double(compactRecordCount) : 1.0
+                    progress?(0.15 * fraction, "Scanning points...")
+                }
+            }
+        } else if data.count == voxelBuffer.length {
+            let totalRecords = data.count / voxelStride
+            var processedRecords = 0
+            for i in stride(from: 0, to: data.count, by: voxelStride) {
+                if isCancelled?() == true { return nil }
+                guard let voxel = readVoxel(at: i) else { break }
+                if voxel.colorAndSampleCount.w <= 0 {
+                    processedRecords += 1
+                    continue
+                }
+                let projected = transformedPoint(voxel)
+                minX = min(minX, projected.x)
+                minY = min(minY, projected.y)
+                minZ = min(minZ, projected.z)
+                maxX = max(maxX, projected.x)
+                maxY = max(maxY, projected.y)
+                maxZ = max(maxZ, projected.z)
+                vertexCount += 1
+                processedRecords += 1
+                if processedRecords % progressUpdateStride == 0 {
+                    let fraction = totalRecords > 0 ? Double(processedRecords) / Double(totalRecords) : 1.0
+                    progress?(0.15 * fraction, "Scanning points...")
+                }
+            }
+        } else {
+            return nil
+        }
+
+        if vertexCount == 0 {
+            vertexCount = max(0, pointCount)
+        }
+        guard vertexCount > 0 else { return nil }
+
+        if !minX.isFinite || !minY.isFinite || !minZ.isFinite ||
+            !maxX.isFinite || !maxY.isFinite || !maxZ.isFinite {
+            return nil
+        }
+
+        let scale = [0.001, 0.001, 0.001]
+        let offset = [minX, minY, minZ]
+        let wkt = crsContext?.wkt ?? ""
+
+        let writer = url.path.withCString { pathCString in
+            wkt.withCString { wktCString in
+                pp_laz_writer_create(
+                    pathCString,
+                    scale[0], scale[1], scale[2],
+                    offset[0], offset[1], offset[2],
+                    50_000,
+                    wktCString
+                )
+            }
+        }
+        guard let writer else { return nil }
+        defer {
+            pp_laz_writer_destroy(writer)
+        }
+
+        progress?(0.18, "Writing LAZ points...")
+        var pointsWritten = 0
+
+        if isCompact {
+            var offsetBytes = headerSize
+            for _ in 0..<compactRecordCount {
+                if isCancelled?() == true { return nil }
+                guard offsetBytes + recordSize <= data.count else { break }
+                let idx = readUInt32(at: offsetBytes) ?? UInt32.max
+                offsetBytes += MemoryLayout<UInt32>.size
+                guard idx < UInt32(maxVoxels), let voxel = readVoxel(at: offsetBytes) else {
+                    offsetBytes += voxelStride
+                    continue
+                }
+                offsetBytes += voxelStride
+                let projected = transformedPoint(voxel)
+                let ok = pp_laz_writer_write_point(
+                    writer,
+                    projected.x,
+                    projected.y,
+                    projected.z,
+                    clampedColor16(voxel.colorAndSampleCount.x),
+                    clampedColor16(voxel.colorAndSampleCount.y),
+                    clampedColor16(voxel.colorAndSampleCount.z),
+                    intensityFromConfidence(voxel.positionAndConfidence.w),
+                    1
+                )
+                guard ok else { return nil }
+                pointsWritten += 1
+                if pointsWritten % progressUpdateStride == 0 {
+                    let fraction = vertexCount > 0 ? Double(pointsWritten) / Double(vertexCount) : 1.0
+                    progress?(0.18 + (0.80 * min(1.0, fraction)), "Writing LAZ points...")
+                }
+            }
+        } else {
+            for i in stride(from: 0, to: data.count, by: voxelStride) {
+                if isCancelled?() == true { return nil }
+                guard let voxel = readVoxel(at: i) else { break }
+                if voxel.colorAndSampleCount.w <= 0 {
+                    continue
+                }
+                let projected = transformedPoint(voxel)
+                let ok = pp_laz_writer_write_point(
+                    writer,
+                    projected.x,
+                    projected.y,
+                    projected.z,
+                    clampedColor16(voxel.colorAndSampleCount.x),
+                    clampedColor16(voxel.colorAndSampleCount.y),
+                    clampedColor16(voxel.colorAndSampleCount.z),
+                    intensityFromConfidence(voxel.positionAndConfidence.w),
+                    1
+                )
+                guard ok else { return nil }
+                pointsWritten += 1
+                if pointsWritten % progressUpdateStride == 0 {
+                    let fraction = vertexCount > 0 ? Double(pointsWritten) / Double(vertexCount) : 1.0
+                    progress?(0.18 + (0.80 * min(1.0, fraction)), "Writing LAZ points...")
+                }
+            }
+        }
+
+        guard pointsWritten > 0 else { return nil }
+        guard pp_laz_writer_close(writer) else { return nil }
+        progress?(0.98, "Finishing LAZ file...")
+
+        return LAZWriteResult(
+            pointCount: pointsWritten,
+            scale: scale,
+            offset: offset,
+            boundsMin: [minX, minY, minZ],
+            boundsMax: [maxX, maxY, maxZ],
+            epsg: crsContext?.epsg,
+            crsName: crsContext?.crsName,
+            georefNote: crsContext?.note,
+            headingDegrees: crsContext?.headingDegrees
+        )
+    }
+
+    private func writeLAZSidecar(
+        to sidecarURL: URL,
+        lazURL: URL,
+        session: ScanSession,
+        captureMetadata: ScanCaptureMetadata?,
+        pointCount: Int,
+        scale: [Double],
+        offset: [Double],
+        boundsMin: [Double],
+        boundsMax: [Double],
+        epsg: Int?,
+        crsName: String?,
+        georefNote: String?,
+        headingDegrees: Double?
+    ) -> Bool {
+        let georef = ScanExportSidecar.Georeference(
+            mode: epsg != nil ? "device_gps_approx_projected" : "local_only",
+            epsg: epsg,
+            crsName: crsName,
+            latitude: captureMetadata?.location?.latitude,
+            longitude: captureMetadata?.location?.longitude,
+            altitude: captureMetadata?.location?.altitude,
+            horizontalAccuracy: captureMetadata?.location?.horizontalAccuracy,
+            verticalAccuracy: captureMetadata?.location?.verticalAccuracy,
+            headingDegrees: headingDegrees ?? captureMetadata?.location?.headingDegrees,
+            note: georefNote,
+            timestamp: captureMetadata?.location?.timestamp
+        )
+
+        let sidecar = ScanExportSidecar(
+            schemaVersion: 1,
+            exportedAt: Date(),
+            scanID: session.id,
+            scanName: session.name,
+            sessionCreatedAt: session.createdAt,
+            sessionUpdatedAt: session.updatedAt,
+            files: .init(laz: lazURL.lastPathComponent, metadata: sidecarURL.lastPathComponent),
+            coordinateFrame: .init(
+                name: crsName ?? "ARKit Local Frame",
+                units: "meters",
+                worldOriginTransform: captureMetadata?.worldOriginTransform ?? [
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    0, 0, 0, 1,
+                ]
+            ),
+            pointSchema: .init(
+                format: "LAS 1.4 / Point Format 2 (LAZ compressed)",
+                coordinateType: "float64 -> int32 quantized",
+                colorType: "uint16 RGB",
+                intensityType: "uint16",
+                classificationType: "uint8",
+                scale: scale,
+                offset: offset,
+                pointCount: pointCount
+            ),
+            georeference: georef,
+            capture: captureMetadata,
+            stats: .init(pointCount: pointCount, boundsMin: boundsMin, boundsMax: boundsMax)
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let jsonData = try? encoder.encode(sidecar) else { return false }
+        do {
+            try jsonData.write(to: sidecarURL, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func writePLY(

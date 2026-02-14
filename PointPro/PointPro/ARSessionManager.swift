@@ -7,6 +7,7 @@ import ARKit
 import Combine
 import CoreVideo
 import CoreMotion
+import CoreLocation
 import UIKit
 
 class ARSessionManager: NSObject, ObservableObject {
@@ -16,6 +17,8 @@ class ARSessionManager: NSObject, ObservableObject {
     @Published var sessionState: String = "Initializing..."
     @Published var depthWidth: Int = 0
     @Published var depthHeight: Int = 0
+    @Published var imageWidth: Int = 0
+    @Published var imageHeight: Int = 0
     @Published var pointsPerFrame: Int = 0
     @Published var averageDepth: Float = 0.0
     @Published var frameCount: Int = 0
@@ -28,6 +31,8 @@ class ARSessionManager: NSObject, ObservableObject {
     @Published var mediumConfidencePercent: Float = 0.0
     @Published var lowConfidencePercent: Float = 0.0
     @Published var hasReceivedFirstFrame: Bool = false
+    @Published private(set) var latestLocationMetadata: CaptureLocationMetadata?
+    @Published private(set) var latestHeadingDegrees: Double?
     
     // MARK: - Engine
     let pointCloudEngine = PointCloudEngine()
@@ -47,6 +52,8 @@ class ARSessionManager: NSObject, ObservableObject {
     private var storageRefreshTimer: Timer?
     private var hasStartedStorageMonitoring = false
     private let motionManager = CMMotionManager()
+    private let locationManager = CLLocationManager()
+    private var hasRequestedLocationPermission = false
     private var flatCandidateStart: Date?
     private let flatConfirmDuration: TimeInterval = 0.3
     private let flatEnterThreshold: Double = 0.92
@@ -55,6 +62,9 @@ class ARSessionManager: NSObject, ObservableObject {
     override init() {
         super.init()
         startMotionUpdates()
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.distanceFilter = 1.0
     }
     
     func startSession() {
@@ -71,6 +81,7 @@ class ARSessionManager: NSObject, ObservableObject {
         session.delegateQueue = sessionDelegateQueue
         session.delegate = self
         session.run(config)
+        startLocationUpdatesIfNeeded()
         
         // Pass session to engine for anchor management
         pointCloudEngine.setARSession(session)
@@ -120,6 +131,23 @@ class ARSessionManager: NSObject, ObservableObject {
     deinit {
         motionManager.stopDeviceMotionUpdates()
         storageRefreshTimer?.invalidate()
+        locationManager.stopUpdatingLocation()
+        locationManager.stopUpdatingHeading()
+    }
+
+    private func startLocationUpdatesIfNeeded() {
+        if !hasRequestedLocationPermission {
+            hasRequestedLocationPermission = true
+            locationManager.requestWhenInUseAuthorization()
+        }
+
+        let status = locationManager.authorizationStatus
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            locationManager.startUpdatingLocation()
+            if CLLocationManager.headingAvailable() {
+                locationManager.startUpdatingHeading()
+            }
+        }
     }
 
 }
@@ -141,6 +169,7 @@ extension ARSessionManager: ARSessionDelegate {
             // HUD Stats calculation
             let width = CVPixelBufferGetWidth(depthData.depthMap)
             let height = CVPixelBufferGetHeight(depthData.depthMap)
+            let imageResolution = frame.camera.imageResolution
             
             // FPS calculation based on ARFrame timestamp delta (stable + clamped)
             if let lastTimestamp = lastDepthFrameTimestamp {
@@ -157,6 +186,8 @@ extension ARSessionManager: ARSessionDelegate {
             DispatchQueue.main.async {
                 self.depthWidth = width
                 self.depthHeight = height
+                self.imageWidth = Int(imageResolution.width)
+                self.imageHeight = Int(imageResolution.height)
                 self.pointsPerFrame = width * height
             }
             
@@ -313,5 +344,41 @@ extension ARSessionManager: ARSessionDelegate {
                 }
             }
         }
+    }
+}
+
+extension ARSessionManager: CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            manager.startUpdatingLocation()
+            if CLLocationManager.headingAvailable() {
+                manager.startUpdatingHeading()
+            }
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last else { return }
+        let course = location.course >= 0 ? location.course : nil
+        let heading = latestHeadingDegrees ?? course
+        latestLocationMetadata = CaptureLocationMetadata(
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            altitude: location.altitude,
+            horizontalAccuracy: location.horizontalAccuracy,
+            verticalAccuracy: location.verticalAccuracy,
+            headingDegrees: heading,
+            timestamp: location.timestamp
+        )
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        var heading = newHeading.trueHeading
+        if heading < 0 {
+            heading = newHeading.magneticHeading
+        }
+        guard heading >= 0 else { return }
+        latestHeadingDegrees = heading
     }
 }

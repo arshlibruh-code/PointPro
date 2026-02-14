@@ -16,11 +16,12 @@ struct PointCloudViewer: View {
     let engine: PointCloudEngine
     let device: MTLDevice
     let session: ScanSession?
-    var onExport: ((ScanSession, PointCloudEngine.PLYExportFormat, @escaping (Double, String) -> Void, @escaping () -> Bool) -> URL?)? = nil
+    let captureMetadata: ScanCaptureMetadata?
+    var onExport: ((ScanSession, PointCloudEngine.ExportFormat, [ScanReportMeasurement], @escaping (Double, String) -> Void, @escaping () -> Bool) -> PointCloudEngine.ExportArtifact?)? = nil
     var onContinue: (() -> Void)? = nil
     @Environment(\.dismiss) var dismiss
     @State private var isExporting = false
-    @State private var exportURL: URL?
+    @State private var exportURLs: [URL] = []
     @State private var showShareSheet = false
     @State private var showExportError = false
     @State private var exportStatusText = "Preparing export..."
@@ -28,6 +29,8 @@ struct PointCloudViewer: View {
     @State private var exportCancellation = ExportCancellationFlag()
     @State private var showExportCancelledNotice = false
     @State private var showExportFormatPicker = false
+    @State private var showGeorefPopover = false
+    @State private var recenterSignal = 0
     @StateObject private var measureController = MeasureController()
     private let buttonHaptic = UIImpactFeedbackGenerator(style: .rigid)
     
@@ -41,6 +44,7 @@ struct PointCloudViewer: View {
                 device: device,
                 engine: engine,
                 isRenderingPaused: showExportFormatPicker,
+                recenterSignal: recenterSignal,
                 measureController: measureController
             )
                 .ignoresSafeArea()
@@ -56,6 +60,20 @@ struct PointCloudViewer: View {
                         }
 
                         for segment in measureController.projectedActiveSegments {
+                            var path = Path()
+                            path.move(to: segment.a)
+                            path.addLine(to: segment.b)
+                            context.stroke(path, with: .color(segment.tint), lineWidth: segment.width)
+                        }
+
+                        for segment in measureController.projectedCommittedSwathSegments {
+                            var path = Path()
+                            path.move(to: segment.a)
+                            path.addLine(to: segment.b)
+                            context.stroke(path, with: .color(segment.tint), lineWidth: segment.width)
+                        }
+
+                        for segment in measureController.projectedActiveSwathSegments {
                             var path = Path()
                             path.move(to: segment.a)
                             path.addLine(to: segment.b)
@@ -126,6 +144,17 @@ struct PointCloudViewer: View {
                     .padding()
 
                     Spacer()
+
+                    Button(action: {
+                        emitTapHaptic()
+                        recenterSignal &+= 1
+                    }) {
+                        Image(systemName: "scope")
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(width: 30, height: 30)
+                    }
+                    .buttonStyle(.glass)
+                    .padding()
                 }
                 
                 Spacer()
@@ -144,9 +173,15 @@ struct PointCloudViewer: View {
                             infoGlass("\(formatNumber(session.pointCount)) POINTS", tint: .blue)
                             infoGlass(formatStorage(session.dataSizeBytes))
                             infoGlass(session.status.rawValue.uppercased())
+                            georefStatusPill
                         }
 
-                        HStack(spacing: 10) {
+                        if measureController.isEnabled, let analysisCard = measureController.currentAnalysisCard {
+                            analysisResultCard(analysisCard)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+
+                        HStack(alignment: .bottom, spacing: 10) {
                             if measureController.isEnabled {
                                 Button(action: {
                                     emitTapHaptic()
@@ -177,30 +212,66 @@ struct PointCloudViewer: View {
 
                             ZStack(alignment: .trailing) {
                                 if measureController.isEnabled {
-                                    HStack(spacing: 8) {
-                                        iconActionButton("plus", label: "Add Vertex") {
-                                            emitTapHaptic()
-                                            measureController.addVertex()
+                                    VStack(alignment: .trailing, spacing: 8) {
+                                        HStack(spacing: 6) {
+                                            measureToolButton(title: "Path", tool: .path)
+                                            measureToolButton(title: "Cross", tool: .crossSection)
+                                            measureToolButton(title: "Elev", tool: .elevationProfile)
                                         }
-                                        .disabled(!measureController.hasSnapPoint)
 
-                                        iconActionButton("arrow.uturn.backward", label: "Undo Vertex") {
-                                            emitTapHaptic()
-                                            measureController.undoLastVertex()
+                                        if measureController.selectedTool == .crossSection {
+                                            HStack(spacing: 8) {
+                                                Text("Swath")
+                                                    .font(.system(.caption2, design: .monospaced).weight(.bold))
+                                                    .foregroundStyle(.secondary)
+                                                Slider(value: $measureController.swathWidthMeters, in: 0.05...2.0, step: 0.01)
+                                                    .tint(.blue)
+                                                    .frame(width: 120)
+                                                Text(formatMeters(measureController.swathWidthMeters))
+                                                    .font(.system(.caption2, design: .monospaced))
+                                                    .foregroundStyle(.primary)
+                                            }
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(.thinMaterial, in: Capsule())
                                         }
-                                        .disabled(!measureController.hasActiveVertices)
 
-                                        iconActionButton("plus.circle", label: "New Measurement") {
-                                            emitTapHaptic()
-                                            measureController.commitOpenMeasurementAndStartNew()
-                                        }
-                                        .disabled(!measureController.canCommitOpenMeasurement)
+                                        HStack(spacing: 8) {
+                                            iconActionButton("plus", label: "Add Vertex") {
+                                                emitTapHaptic()
+                                                measureController.addVertex()
+                                            }
+                                            .disabled(!measureController.hasSnapPoint)
 
-                                        iconActionButton("seal", label: "Close Shape") {
-                                            emitTapHaptic()
-                                            measureController.closeCurrentMeasurement()
+                                            iconActionButton("arrow.uturn.backward", label: "Undo Vertex") {
+                                                emitTapHaptic()
+                                                measureController.undoLastVertex()
+                                            }
+                                            .disabled(!measureController.hasActiveVertices)
+
+                                            if measureController.selectedTool == .path {
+                                                iconActionButton("checkmark", label: "Finish Line") {
+                                                    emitTapHaptic()
+                                                    measureController.commitOpenMeasurementAndStartNew()
+                                                }
+                                                .disabled(!measureController.canCommitOpenMeasurement)
+
+                                                iconActionButton("seal", label: "Close Shape") {
+                                                    emitTapHaptic()
+                                                    measureController.closeCurrentMeasurement()
+                                                }
+                                                .disabled(!measureController.canCloseCurrentMeasurement)
+                                            } else {
+                                                iconActionButton(
+                                                    measureController.selectedTool == .crossSection ? "square.split.2x1" : "chart.xyaxis.line",
+                                                    label: measureController.selectedTool == .crossSection ? "Analyze Cross Section" : "Generate Elevation Profile"
+                                                ) {
+                                                    emitTapHaptic()
+                                                    measureController.finalizeActiveMeasurementForCurrentTool()
+                                                }
+                                                .disabled(!measureController.canFinalizeCurrentTool)
+                                            }
                                         }
-                                        .disabled(!measureController.canCloseCurrentMeasurement)
                                     }
                                     .padding(.vertical, 2)
                                     .id("measure-actions")
@@ -298,8 +369,8 @@ struct PointCloudViewer: View {
             }
         }
         .sheet(isPresented: $showShareSheet) {
-            if let exportURL {
-                ShareSheet(activityItems: [exportURL])
+            if !exportURLs.isEmpty {
+                ShareSheet(activityItems: exportURLs)
             }
         }
         .confirmationDialog(
@@ -308,13 +379,23 @@ struct PointCloudViewer: View {
             titleVisibility: .visible
         ) {
             if let session {
-                Button("PLY (Fast Binary)") {
+                Button("LAZ") {
                     emitTapHaptic()
-                    startExport(session: session, format: .binaryLittleEndian)
+                    startExport(session: session, format: .laz)
                 }
-                Button("PLY (Readable ASCII)") {
+                .tint(.blue)
+                .keyboardShortcut(.defaultAction)
+                Button("PLY Binary Fast") {
                     emitTapHaptic()
-                    startExport(session: session, format: .ascii)
+                    startExport(session: session, format: .plyBinaryLittleEndian)
+                }
+                Button("PLY Text ASCII") {
+                    emitTapHaptic()
+                    startExport(session: session, format: .plyAscii)
+                }
+                Button("PDF Report") {
+                    emitTapHaptic()
+                    startExport(session: session, format: .pdfReport)
                 }
             }
             Button("Cancel", role: .cancel) {}
@@ -358,6 +439,201 @@ struct PointCloudViewer: View {
         .accessibilityLabel(label)
     }
 
+    @ViewBuilder
+    private func measureToolButton(title: String, tool: MeasureController.MeasureTool) -> some View {
+        let isActive = measureController.selectedTool == tool
+        if isActive {
+            Button(action: {
+                emitTapHaptic()
+                measureController.setTool(tool)
+            }) {
+                Text(title.uppercased())
+                    .font(.system(.caption2, design: .monospaced).weight(.bold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 28)
+            }
+            .buttonStyle(.glassProminent)
+            .tint(.blue)
+            .accessibilityLabel(title)
+        } else {
+            Button(action: {
+                emitTapHaptic()
+                measureController.setTool(tool)
+            }) {
+                Text(title.uppercased())
+                    .font(.system(.caption2, design: .monospaced).weight(.bold))
+                    .padding(.horizontal, 8)
+                    .frame(height: 28)
+            }
+            .buttonStyle(.glass)
+            .tint(.gray)
+            .accessibilityLabel(title)
+        }
+    }
+
+    @ViewBuilder
+    private func analysisResultCard(_ card: MeasureController.AnalysisCardModel) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("M\(card.measurementOrdinal) \(card.tool == .crossSection ? "CROSS SECTION" : "ELEVATION PROFILE")")
+                    .font(.system(.caption2, design: .monospaced).weight(.bold))
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                Text("\(card.resultIndex)/\(card.resultCount)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                analysisNavButton("chevron.left") {
+                    emitTapHaptic()
+                    measureController.selectPreviousAnalysisCard()
+                }
+                analysisNavButton("chevron.right") {
+                    emitTapHaptic()
+                    measureController.selectNextAnalysisCard()
+                }
+                analysisNavButton("xmark") {
+                    emitTapHaptic()
+                    measureController.dismissAnalysisCard()
+                }
+            }
+
+            if card.canAdjustStation {
+                HStack(spacing: 8) {
+                    Text("Station")
+                        .font(.system(.caption2, design: .monospaced).weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Slider(
+                        value: Binding(
+                            get: { Double(card.stationFraction) },
+                            set: { measureController.updateCurrentAnalysisStation(Float($0)) }
+                        ),
+                        in: 0...1
+                    )
+                    .tint(.blue)
+                    Text("\(Int((card.stationFraction * 100).rounded()))%")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .frame(width: 36, alignment: .trailing)
+                }
+            }
+
+            analysisChart(card)
+                .frame(height: 120)
+
+            if card.tool == .crossSection {
+                Text("L \(formatFloat(card.pathLength))m • W \(formatFloat(card.swathWidthMeters ?? 0))m • Slice \(card.sectionPointCount ?? 0) • Corridor \(card.corridorPointCount)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("Bin \(formatOptional(card.profileBinWidthMeters))m • Win \(formatOptional(card.stationWindowMeters))m • Cloud \(card.sourceSampleCount)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("Min/Max \(formatOptional(card.minElevation))/\(formatOptional(card.maxElevation))m • Relief \(formatOptional(card.relief))m")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("L \(formatFloat(card.pathLength))m • Min/Max \(formatOptional(card.minElevation))/\(formatOptional(card.maxElevation))m")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("Bin \(formatOptional(card.profileBinWidthMeters))m • Corridor \(card.corridorPointCount) • Cloud \(card.sourceSampleCount)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("Rise/Fall \(formatOptional(card.totalRise))/\(formatOptional(card.totalFall))m • Slope \(formatOptional(card.averageSlopePercent))%/\(formatOptional(card.maxSlopePercent))%")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func analysisChart(_ card: MeasureController.AnalysisCardModel) -> some View {
+        GeometryReader { proxy in
+            Canvas { context, _ in
+                let width = proxy.size.width
+                let height = proxy.size.height
+                let inset: CGFloat = 8
+                let rect = CGRect(x: inset, y: inset, width: max(1, width - inset * 2), height: max(1, height - inset * 2))
+                context.fill(Path(roundedRect: rect, cornerRadius: 8), with: .color(.black.opacity(0.12)))
+
+                for idx in 1...3 {
+                    let y = rect.minY + (CGFloat(idx) / 4.0) * rect.height
+                    var grid = Path()
+                    grid.move(to: CGPoint(x: rect.minX, y: y))
+                    grid.addLine(to: CGPoint(x: rect.maxX, y: y))
+                    context.stroke(grid, with: .color(.white.opacity(0.14)), lineWidth: 0.6)
+                }
+
+                if card.tool == .crossSection, card.sectionScatter.count >= 3 {
+                    let xs = card.sectionScatter.map(\.x)
+                    let ys = card.sectionScatter.map(\.y)
+                    guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return }
+                    let spanX = max(0.001, maxX - minX)
+                    let spanY = max(0.001, maxY - minY)
+                    for p in card.sectionScatter {
+                        let nx = (p.x - minX) / spanX
+                        let ny = (p.y - minY) / spanY
+                        let mapped = CGPoint(
+                            x: rect.minX + CGFloat(nx) * rect.width,
+                            y: rect.maxY - CGFloat(ny) * rect.height
+                        )
+                        let pointColor = Color(uiColor: UIColor(
+                            red: CGFloat(max(0, min(1, p.color.x))),
+                            green: CGFloat(max(0, min(1, p.color.y))),
+                            blue: CGFloat(max(0, min(1, p.color.z))),
+                            alpha: 1
+                        ))
+                        context.fill(
+                            Path(ellipseIn: CGRect(x: mapped.x - 1.2, y: mapped.y - 1.2, width: 2.4, height: 2.4)),
+                            with: .color(pointColor.opacity(0.88))
+                        )
+                    }
+                } else if card.profileSamples.count >= 2 {
+                    let minD = card.profileSamples.first?.distance ?? 0
+                    let maxD = card.profileSamples.last?.distance ?? 1
+                    let minY = card.profileSamples.map(\.elevation).min() ?? 0
+                    let maxY = card.profileSamples.map(\.elevation).max() ?? 1
+                    let spanD = max(0.001, maxD - minD)
+                    let spanY = max(0.001, maxY - minY)
+                    var line = Path()
+                    for (idx, sample) in card.profileSamples.enumerated() {
+                        let nx = (sample.distance - minD) / spanD
+                        let ny = (sample.elevation - minY) / spanY
+                        let mapped = CGPoint(
+                            x: rect.minX + CGFloat(nx) * rect.width,
+                            y: rect.maxY - CGFloat(ny) * rect.height
+                        )
+                        if idx == 0 {
+                            line.move(to: mapped)
+                        } else {
+                            line.addLine(to: mapped)
+                        }
+                    }
+                    context.stroke(line, with: .color(card.tool == .elevationProfile ? .blue : .green), lineWidth: 1.8)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func analysisNavButton(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 22, height: 22)
+        }
+        .buttonStyle(.glass)
+    }
+
+    private func formatFloat(_ value: Float, digits: Int = 2) -> String {
+        String(format: "%.\(digits)f", value)
+    }
+
+    private func formatOptional(_ value: Float?, digits: Int = 2) -> String {
+        guard let value else { return "-" }
+        return String(format: "%.\(digits)f", value)
+    }
+
     private func formatStorage(_ bytes: Int64) -> String {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB]
@@ -379,18 +655,151 @@ struct PointCloudViewer: View {
         return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
-    private func startExport(session: ScanSession, format: PointCloudEngine.PLYExportFormat) {
+    private func formatMeters(_ value: Double) -> String {
+        let formatter = NumberFormatter()
+        formatter.maximumFractionDigits = 1
+        formatter.minimumFractionDigits = 1
+        let formatted = formatter.string(from: NSNumber(value: max(0, value))) ?? "\(value)"
+        return "\(formatted)m"
+    }
+
+    @ViewBuilder
+    private var georefStatusPill: some View {
+        Button(action: {
+            emitTapHaptic()
+            showGeorefPopover = true
+        }) {
+            Image(systemName: georefIconName)
+                .font(.system(.caption, design: .monospaced).bold())
+                .foregroundStyle(georefIconTint)
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel("Georeference Details")
+        .popover(isPresented: $showGeorefPopover, attachmentAnchor: .point(.top), arrowEdge: .bottom) {
+            georefDetailsPopover
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    @ViewBuilder
+    private var georefDetailsPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            georefDetailRow(label: "Mode", value: georefMode)
+            georefDetailRow(label: "EPSG / CRS", value: georefEPSGAndCRS)
+            georefDetailRow(label: "Accuracy", value: georefHorizontalAccuracy)
+            georefDetailRow(label: "Lat / Lon", value: georefLatLon)
+            georefDetailRow(label: "Altitude", value: georefAltitude)
+            georefDetailRow(label: "Heading", value: georefHeading)
+
+            Text("Approximate only. Use GCP/checkpoints for survey-grade georeferencing.")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+        }
+        .padding(14)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial)
+    }
+
+    @ViewBuilder
+    private func georefDetailRow(label: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label.uppercased())
+                .font(.system(.caption2, design: .monospaced).weight(.bold))
+                .foregroundStyle(.secondary)
+                .frame(width: 82, alignment: .leading)
+            Text(value)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.primary)
+        }
+    }
+
+    private func inferredEPSG(from location: CaptureLocationMetadata) -> Int? {
+        let latitude = location.latitude
+        let longitude = location.longitude
+        guard latitude.isFinite, longitude.isFinite else { return nil }
+        guard abs(latitude) <= 84.0, abs(longitude) <= 180.0 else { return nil }
+        let zone = max(1, min(60, Int(floor((longitude + 180.0) / 6.0)) + 1))
+        return (latitude >= 0 ? 32600 : 32700) + zone
+    }
+
+    private func inferredCRSName(from location: CaptureLocationMetadata) -> String? {
+        guard inferredEPSG(from: location) != nil else { return nil }
+        let zone = max(1, min(60, Int(floor((location.longitude + 180.0) / 6.0)) + 1))
+        let hemisphere = location.latitude >= 0 ? "N" : "S"
+        return "WGS 84 / UTM zone \(zone)\(hemisphere)"
+    }
+
+    private var georefIconName: String {
+        captureMetadata?.location == nil ? "location.slash.fill" : "location.fill"
+    }
+
+    private var georefIconTint: Color {
+        captureMetadata?.location == nil ? .red : .green
+    }
+
+    private var georefMode: String {
+        captureMetadata?.location == nil ? "Local Only (No GPS)" : "GPS Approximate"
+    }
+
+    private var georefEPSGAndCRS: String {
+        guard let location = captureMetadata?.location else { return "N/A" }
+        guard let epsg = inferredEPSG(from: location) else { return "Unknown" }
+        let crs = inferredCRSName(from: location) ?? "Unknown CRS"
+        return "EPSG:\(epsg) • \(crs)"
+    }
+
+    private var georefHorizontalAccuracy: String {
+        guard let location = captureMetadata?.location else { return "N/A" }
+        guard location.horizontalAccuracy > 0 else { return "Unknown" }
+        return formatMeters(location.horizontalAccuracy)
+    }
+
+    private var georefLatLon: String {
+        guard let location = captureMetadata?.location else { return "N/A" }
+        return "\(formatCoordinate(location.latitude)), \(formatCoordinate(location.longitude))"
+    }
+
+    private var georefAltitude: String {
+        guard let location = captureMetadata?.location else { return "N/A" }
+        return String(format: "%.1fm", location.altitude)
+    }
+
+    private var georefHeading: String {
+        guard let location = captureMetadata?.location,
+              let heading = location.headingDegrees,
+              heading.isFinite else { return "N/A" }
+        let normalized = heading.truncatingRemainder(dividingBy: 360)
+        let wrapped = normalized >= 0 ? normalized : (normalized + 360)
+        return String(format: "%.1f°", wrapped)
+    }
+
+    private func formatCoordinate(_ value: Double) -> String {
+        String(format: "%.6f", value)
+    }
+
+    private func startExport(session: ScanSession, format: PointCloudEngine.ExportFormat) {
         guard let onExport else { return }
         guard !isExporting else { return }
         exportCancellation = ExportCancellationFlag()
         exportProgress = 0
-        exportStatusText = format == .binaryLittleEndian ? "Generating binary PLY..." : "Generating ASCII PLY..."
+        switch format {
+        case .laz:
+            exportStatusText = "Generating LAZ..."
+        case .plyBinaryLittleEndian:
+            exportStatusText = "Generating binary PLY..."
+        case .plyAscii:
+            exportStatusText = "Generating ASCII PLY..."
+        case .pdfReport:
+            exportStatusText = "Generating PDF report..."
+        }
         isExporting = true
         showExportCancelledNotice = false
         DispatchQueue.global(qos: .utility).async {
-            let url = onExport(
+            let artifact = onExport(
                 session,
                 format,
+                measureController.exportMeasurements(),
                 { progress, message in
                     DispatchQueue.main.async {
                         guard isExporting else { return }
@@ -404,8 +813,8 @@ struct PointCloudViewer: View {
             )
             DispatchQueue.main.async {
                 isExporting = false
-                if let url {
-                    exportURL = url
+                if let artifact {
+                    exportURLs = artifact.shareItems
                     showShareSheet = true
                 } else if exportCancellation.isCancelled {
                     showExportCancelledNotice = true
@@ -418,9 +827,19 @@ struct PointCloudViewer: View {
 }
 
 final class MeasureController: ObservableObject {
+    enum MeasureTool: String, CaseIterable {
+        case path
+        case crossSection
+        case elevationProfile
+    }
+
     struct MeasurementPath {
+        let id: UUID
+        let createdAt: Date
+        let tool: MeasureTool
         var vertices: [SIMD3<Float>]
         var isClosed: Bool
+        var swathWidthMeters: Float?
     }
 
     struct OverlayLabel: Identifiable {
@@ -437,22 +856,101 @@ final class MeasureController: ObservableObject {
         let width: CGFloat
     }
 
+    struct ProfileSample: Hashable {
+        let distance: Float
+        let elevation: Float
+    }
+
+    struct CloudSamplePoint {
+        let position: SIMD3<Float>
+        let color: SIMD3<Float> // normalized 0...1
+    }
+
+    struct SectionScatterPoint {
+        let x: Float
+        let y: Float
+        let color: SIMD3<Float> // normalized 0...1
+    }
+
+    struct AnalysisCardModel {
+        let measurementID: UUID
+        let measurementOrdinal: Int
+        let tool: MeasureTool
+        let createdAt: Date
+        let pathLength: Float
+        let swathWidthMeters: Float?
+        let profileSamples: [ProfileSample]
+        let sectionScatter: [SectionScatterPoint]
+        let sectionPointCount: Int?
+        let sourceSampleCount: Int
+        let corridorPointCount: Int
+        let profileBinWidthMeters: Float?
+        let stationWindowMeters: Float?
+        let minElevation: Float?
+        let maxElevation: Float?
+        let relief: Float?
+        let totalRise: Float?
+        let totalFall: Float?
+        let averageSlopePercent: Float?
+        let maxSlopePercent: Float?
+        let stationFraction: Float
+        let canAdjustStation: Bool
+        let resultIndex: Int
+        let resultCount: Int
+    }
+
     @Published var isEnabled = false
     @Published var hasSnapPoint = false
     @Published var projectedActiveVertices: [CGPoint] = []
     @Published var projectedCommittedVertices: [CGPoint] = []
     @Published var projectedActiveSegments: [ScreenSegment] = []
     @Published var projectedCommittedSegments: [ScreenSegment] = []
+    @Published var projectedActiveSwathSegments: [ScreenSegment] = []
+    @Published var projectedCommittedSwathSegments: [ScreenSegment] = []
     @Published var projectedSnapPoint: CGPoint?
     @Published var overlayLabels: [OverlayLabel] = []
+    @Published var selectedTool: MeasureTool = .path
+    @Published var swathWidthMeters: Double = 0.25
+    @Published var currentAnalysisCard: AnalysisCardModel?
 
     var hasActiveVertices: Bool { !activeVertices.isEmpty }
-    var canCloseCurrentMeasurement: Bool { activeVertices.count >= 3 }
-    var canCommitOpenMeasurement: Bool { activeVertices.count >= 2 }
+    var canCloseCurrentMeasurement: Bool { selectedTool == .path && activeVertices.count >= 3 }
+    var canCommitOpenMeasurement: Bool { selectedTool == .path && activeVertices.count >= 2 }
+    var canFinalizeCurrentTool: Bool { activeVertices.count >= 2 }
+
+    private struct CorridorPoint {
+        let alongDistance: Float
+        let lateralDistanceSigned: Float
+        let elevation: Float
+        let color: SIMD3<Float>
+    }
+
+    private struct ComputedAnalysis {
+        var profileSamples: [ProfileSample]
+        var corridorPoints: [CorridorPoint]
+        var pathLength: Float
+        var swathWidthMeters: Float?
+        var sourceSampleCount: Int
+        var corridorPointCount: Int
+        var profileBinWidthMeters: Float?
+        var stationWindowMeters: Float?
+        var minElevation: Float?
+        var maxElevation: Float?
+        var relief: Float?
+        var totalRise: Float?
+        var totalFall: Float?
+        var averageSlopePercent: Float?
+        var maxSlopePercent: Float?
+        var stationFraction: Float
+        var sectionHalfWindow: Float
+    }
 
     private var snapPoint: SIMD3<Float>?
     private var activeVertices: [SIMD3<Float>] = []
     private var committedPaths: [MeasurementPath] = []
+    private var sampledCloudPoints: [CloudSamplePoint] = []
+    private var analysisByPathID: [UUID: ComputedAnalysis] = [:]
+    private var selectedAnalysisPathID: UUID?
 
     func currentSnapWorldPoint() -> SIMD3<Float>? {
         snapPoint
@@ -467,9 +965,18 @@ final class MeasureController: ObservableObject {
             projectedCommittedVertices = []
             projectedActiveSegments = []
             projectedCommittedSegments = []
+            projectedActiveSwathSegments = []
+            projectedCommittedSwathSegments = []
             projectedSnapPoint = nil
             overlayLabels = []
+            selectedTool = .path
+            currentAnalysisCard = nil
+            selectedAnalysisPathID = nil
         }
+    }
+
+    func setTool(_ tool: MeasureTool) {
+        selectedTool = tool
     }
 
     func addVertex() {
@@ -482,26 +989,646 @@ final class MeasureController: ObservableObject {
         activeVertices.removeLast()
     }
 
+    func selectPreviousAnalysisCard() {
+        let ids = analysisDisplayOrder()
+        guard !ids.isEmpty else { return }
+        guard let selected = selectedAnalysisPathID, let idx = ids.firstIndex(of: selected) else {
+            selectedAnalysisPathID = ids.last
+            rebuildCurrentAnalysisCard()
+            return
+        }
+        let prevIndex = idx == 0 ? (ids.count - 1) : (idx - 1)
+        selectedAnalysisPathID = ids[prevIndex]
+        rebuildCurrentAnalysisCard()
+    }
+
+    func selectNextAnalysisCard() {
+        let ids = analysisDisplayOrder()
+        guard !ids.isEmpty else { return }
+        guard let selected = selectedAnalysisPathID, let idx = ids.firstIndex(of: selected) else {
+            selectedAnalysisPathID = ids.first
+            rebuildCurrentAnalysisCard()
+            return
+        }
+        let nextIndex = (idx + 1) % ids.count
+        selectedAnalysisPathID = ids[nextIndex]
+        rebuildCurrentAnalysisCard()
+    }
+
+    func dismissAnalysisCard() {
+        selectedAnalysisPathID = nil
+        currentAnalysisCard = nil
+    }
+
+    func updateCurrentAnalysisStation(_ fraction: Float) {
+        guard let selectedAnalysisPathID, var analysis = analysisByPathID[selectedAnalysisPathID] else { return }
+        analysis.stationFraction = min(max(fraction, 0), 1)
+        analysisByPathID[selectedAnalysisPathID] = analysis
+        rebuildCurrentAnalysisCard()
+    }
+
     func closeCurrentMeasurement() {
-        guard activeVertices.count >= 3 else { return }
-        committedPaths.append(MeasurementPath(vertices: activeVertices, isClosed: true))
+        guard canCloseCurrentMeasurement else { return }
+        committedPaths.append(MeasurementPath(
+            id: UUID(),
+            createdAt: Date(),
+            tool: .path,
+            vertices: activeVertices,
+            isClosed: true,
+            swathWidthMeters: nil
+        ))
         activeVertices = []
+        rebuildCurrentAnalysisCard()
     }
 
     func commitOpenMeasurementAndStartNew() {
-        guard activeVertices.count >= 2 else { return }
-        committedPaths.append(MeasurementPath(vertices: activeVertices, isClosed: false))
+        guard canCommitOpenMeasurement else { return }
+        committedPaths.append(MeasurementPath(
+            id: UUID(),
+            createdAt: Date(),
+            tool: .path,
+            vertices: activeVertices,
+            isClosed: false,
+            swathWidthMeters: nil
+        ))
         activeVertices = []
+        rebuildCurrentAnalysisCard()
+    }
+
+    func finalizeActiveMeasurementForCurrentTool() {
+        guard canFinalizeCurrentTool else { return }
+        switch selectedTool {
+        case .path:
+            commitOpenMeasurementAndStartNew()
+        case .crossSection:
+            let newPath = MeasurementPath(
+                id: UUID(),
+                createdAt: Date(),
+                tool: .crossSection,
+                vertices: activeVertices,
+                isClosed: false,
+                swathWidthMeters: Float(swathWidthMeters)
+            )
+            committedPaths.append(newPath)
+            refreshAnalysis(for: newPath)
+            selectedAnalysisPathID = newPath.id
+            rebuildCurrentAnalysisCard()
+            activeVertices = []
+        case .elevationProfile:
+            let newPath = MeasurementPath(
+                id: UUID(),
+                createdAt: Date(),
+                tool: .elevationProfile,
+                vertices: activeVertices,
+                isClosed: false,
+                swathWidthMeters: nil
+            )
+            committedPaths.append(newPath)
+            refreshAnalysis(for: newPath)
+            selectedAnalysisPathID = newPath.id
+            rebuildCurrentAnalysisCard()
+            activeVertices = []
+        }
+    }
+
+    private struct ElevationStats {
+        let minElevation: Float
+        let maxElevation: Float
+        let relief: Float
+        let totalRise: Float
+        let totalFall: Float
+        let averageSlopePercent: Float
+        let maxSlopePercent: Float
+    }
+
+    private func computeElevationStats(vertices: [SIMD3<Float>]) -> ElevationStats? {
+        guard vertices.count >= 2 else { return nil }
+        var minY = Float.greatestFiniteMagnitude
+        var maxY = -Float.greatestFiniteMagnitude
+        var totalRise: Float = 0
+        var totalFall: Float = 0
+        var maxSlopePercent: Float = 0
+        var totalHorizontalDistance: Float = 0
+
+        for idx in 1..<vertices.count {
+            let a = vertices[idx - 1]
+            let b = vertices[idx]
+            minY = min(minY, a.y, b.y)
+            maxY = max(maxY, a.y, b.y)
+
+            let deltaY = b.y - a.y
+            if deltaY >= 0 {
+                totalRise += deltaY
+            } else {
+                totalFall += abs(deltaY)
+            }
+
+            let horizontalDistance = simd_length(SIMD2<Float>(b.x - a.x, b.z - a.z))
+            totalHorizontalDistance += horizontalDistance
+            if horizontalDistance > 1e-6 {
+                let slopePercent = abs(deltaY / horizontalDistance) * 100
+                maxSlopePercent = max(maxSlopePercent, slopePercent)
+            }
+        }
+
+        guard minY.isFinite, maxY.isFinite else { return nil }
+        let relief = max(0, maxY - minY)
+        let averageSlopePercent = totalHorizontalDistance > 1e-6
+            ? ((totalRise + totalFall) / totalHorizontalDistance) * 100
+            : 0
+        return ElevationStats(
+            minElevation: minY,
+            maxElevation: maxY,
+            relief: relief,
+            totalRise: totalRise,
+            totalFall: totalFall,
+            averageSlopePercent: averageSlopePercent,
+            maxSlopePercent: maxSlopePercent
+        )
+    }
+
+    private func reportType(for path: MeasurementPath) -> ScanReportMeasurementType {
+        switch path.tool {
+        case .path:
+            if path.isClosed { return .closedArea }
+            return path.vertices.count == 2 ? .distance : .polyline
+        case .crossSection:
+            return .crossSection
+        case .elevationProfile:
+            return .elevationProfile
+        }
+    }
+
+    private func analysisDisplayOrder() -> [UUID] {
+        committedPaths
+            .filter { $0.tool == .crossSection || $0.tool == .elevationProfile }
+            .map(\.id)
+            .filter { analysisByPathID[$0] != nil }
+    }
+
+    private func signedLateral(
+        segment: SIMD2<Float>,
+        vectorFromStart: SIMD2<Float>,
+        distance: Float
+    ) -> Float {
+        guard distance > 0 else { return 0 }
+        let cross = (segment.x * vectorFromStart.y) - (segment.y * vectorFromStart.x)
+        let sign: Float = cross >= 0 ? 1 : -1
+        return distance * sign
+    }
+
+    private func fallbackProfile(for vertices: [SIMD3<Float>]) -> [ProfileSample] {
+        guard vertices.count >= 2 else { return [] }
+        var samples: [ProfileSample] = [ProfileSample(distance: 0, elevation: vertices[0].y)]
+        var total: Float = 0
+        for idx in 1..<vertices.count {
+            let a = SIMD2<Float>(vertices[idx - 1].x, vertices[idx - 1].z)
+            let b = SIMD2<Float>(vertices[idx].x, vertices[idx].z)
+            total += simd_length(b - a)
+            samples.append(ProfileSample(distance: total, elevation: vertices[idx].y))
+        }
+        return samples
+    }
+
+    private func median(_ values: [Float]) -> Float {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        if sorted.count % 2 == 1 { return sorted[sorted.count / 2] }
+        return (sorted[(sorted.count / 2) - 1] + sorted[sorted.count / 2]) * 0.5
+    }
+
+    private func percentile(_ values: [Float], fraction: Float) -> Float {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        let p = max(0, min(1, fraction))
+        let idx = Int(round(p * Float(sorted.count - 1)))
+        return sorted[max(0, min(sorted.count - 1, idx))]
+    }
+
+    private func fillMissing(_ values: inout [Float?]) {
+        guard let firstValid = values.firstIndex(where: { $0 != nil }) else { return }
+        for idx in 0..<firstValid {
+            values[idx] = values[firstValid]
+        }
+        var lastKnown = firstValid
+        for idx in (firstValid + 1)..<values.count {
+            if values[idx] != nil {
+                let start = lastKnown
+                let end = idx
+                let gap = end - start
+                if gap > 1, let startValue = values[start], let endValue = values[end] {
+                    for g in 1..<gap {
+                        let t = Float(g) / Float(gap)
+                        values[start + g] = startValue + ((endValue - startValue) * t)
+                    }
+                }
+                lastKnown = idx
+            }
+        }
+        for idx in (lastKnown + 1)..<values.count {
+            values[idx] = values[lastKnown]
+        }
+    }
+
+    private func smoothSeries(_ values: [Float], radius: Int) -> [Float] {
+        guard !values.isEmpty, radius > 0 else { return values }
+        var result = values
+        for idx in values.indices {
+            var weightedSum: Float = 0
+            var weightTotal: Float = 0
+            let start = max(values.startIndex, idx - radius)
+            let end = min(values.endIndex - 1, idx + radius)
+            for sampleIdx in start...end {
+                let offset = abs(sampleIdx - idx)
+                let weight = Float(radius - offset + 1)
+                weightedSum += values[sampleIdx] * weight
+                weightTotal += weight
+            }
+            result[idx] = weightTotal > 0 ? (weightedSum / weightTotal) : values[idx]
+        }
+        return result
+    }
+
+    private func computeProfileStats(_ profileSamples: [ProfileSample]) -> (
+        pathLength: Float,
+        minElevation: Float?,
+        maxElevation: Float?,
+        relief: Float?,
+        totalRise: Float?,
+        totalFall: Float?,
+        averageSlopePercent: Float?,
+        maxSlopePercent: Float?
+    ) {
+        guard profileSamples.count >= 2 else {
+            return (0, nil, nil, nil, nil, nil, nil, nil)
+        }
+        let minElevation = profileSamples.map(\.elevation).min()
+        let maxElevation = profileSamples.map(\.elevation).max()
+        var totalRise: Float = 0
+        var totalFall: Float = 0
+        var maxSlope: Float = 0
+        var totalHorizontal: Float = 0
+        var totalAbsDelta: Float = 0
+        for idx in 1..<profileSamples.count {
+            let d = profileSamples[idx].distance - profileSamples[idx - 1].distance
+            guard d > 1e-6 else { continue }
+            let dz = profileSamples[idx].elevation - profileSamples[idx - 1].elevation
+            if dz >= 0 {
+                totalRise += dz
+            } else {
+                totalFall += abs(dz)
+            }
+            totalHorizontal += d
+            totalAbsDelta += abs(dz)
+            maxSlope = max(maxSlope, abs(dz / d) * 100)
+        }
+        let avgSlope = totalHorizontal > 1e-6 ? (totalAbsDelta / totalHorizontal * 100) : 0
+        let length = max(0, profileSamples.last!.distance - profileSamples.first!.distance)
+        return (
+            length,
+            minElevation,
+            maxElevation,
+            (minElevation != nil && maxElevation != nil) ? max(0, maxElevation! - minElevation!) : nil,
+            totalRise,
+            totalFall,
+            avgSlope,
+            maxSlope
+        )
+    }
+
+    private func refreshAnalysis(for path: MeasurementPath) {
+        guard path.tool == .crossSection || path.tool == .elevationProfile else { return }
+        let analysis = buildAnalysis(for: path)
+        analysisByPathID[path.id] = analysis
+    }
+
+    private func buildAnalysis(for path: MeasurementPath) -> ComputedAnalysis {
+        guard path.vertices.count >= 2 else {
+            return ComputedAnalysis(
+                profileSamples: [],
+                corridorPoints: [],
+                pathLength: 0,
+                swathWidthMeters: path.swathWidthMeters,
+                sourceSampleCount: sampledCloudPoints.count,
+                corridorPointCount: 0,
+                profileBinWidthMeters: nil,
+                stationWindowMeters: nil,
+                minElevation: nil,
+                maxElevation: nil,
+                relief: nil,
+                totalRise: nil,
+                totalFall: nil,
+                averageSlopePercent: nil,
+                maxSlopePercent: nil,
+                stationFraction: 0.5,
+                sectionHalfWindow: max(0.06, min(1.2, (path.swathWidthMeters ?? 0.12) * 0.9))
+            )
+        }
+
+        struct SegmentInfo {
+            let a: SIMD2<Float>
+            let v: SIMD2<Float>
+            let len: Float
+            let invLen2: Float
+            let startDistance: Float
+        }
+
+        let profileSwath = path.tool == .crossSection ? max(0.04, path.swathWidthMeters ?? 0.12) : max(0.12, path.swathWidthMeters ?? 0.12)
+        let profileHalf = profileSwath * 0.5
+        let sectionHalfWindow = max(0.06, min(1.2, (path.swathWidthMeters ?? 0.12) * 0.9))
+
+        var segments: [SegmentInfo] = []
+        segments.reserveCapacity(path.vertices.count - 1)
+        var cumulativeDistance: Float = 0
+        for idx in 1..<path.vertices.count {
+            let a = SIMD2<Float>(path.vertices[idx - 1].x, path.vertices[idx - 1].z)
+            let b = SIMD2<Float>(path.vertices[idx].x, path.vertices[idx].z)
+            let v = b - a
+            let len = simd_length(v)
+            guard len > 1e-6 else { continue }
+            segments.append(
+                SegmentInfo(
+                    a: a,
+                    v: v,
+                    len: len,
+                    invLen2: 1.0 / simd_length_squared(v),
+                    startDistance: cumulativeDistance
+                )
+            )
+            cumulativeDistance += len
+        }
+
+        guard !segments.isEmpty, cumulativeDistance > 1e-6 else {
+            let profile = fallbackProfile(for: path.vertices)
+            let stats = computeProfileStats(profile)
+            let fallbackBinWidth: Float? = profile.count >= 2
+                ? max(1e-6, stats.pathLength / Float(profile.count - 1))
+                : nil
+            return ComputedAnalysis(
+                profileSamples: profile,
+                corridorPoints: [],
+                pathLength: stats.pathLength,
+                swathWidthMeters: path.swathWidthMeters,
+                sourceSampleCount: sampledCloudPoints.count,
+                corridorPointCount: 0,
+                profileBinWidthMeters: fallbackBinWidth,
+                stationWindowMeters: sectionHalfWindow * 2,
+                minElevation: stats.minElevation,
+                maxElevation: stats.maxElevation,
+                relief: stats.relief,
+                totalRise: stats.totalRise,
+                totalFall: stats.totalFall,
+                averageSlopePercent: stats.averageSlopePercent,
+                maxSlopePercent: stats.maxSlopePercent,
+                stationFraction: 0.5,
+                sectionHalfWindow: sectionHalfWindow
+            )
+        }
+
+        var corridor: [CorridorPoint] = []
+        corridor.reserveCapacity(8_000)
+        for samplePoint in sampledCloudPoints {
+            let point = samplePoint.position
+            let p2 = SIMD2<Float>(point.x, point.z)
+            var bestDistance = Float.greatestFiniteMagnitude
+            var bestAlong: Float = 0
+            var bestSigned: Float = 0
+            for segment in segments {
+                let w = p2 - segment.a
+                let rawT = simd_dot(w, segment.v) * segment.invLen2
+                let t = max(0, min(1, rawT))
+                let projected = segment.a + (segment.v * t)
+                let delta = p2 - projected
+                let lateralDistance = simd_length(delta)
+                if lateralDistance < bestDistance {
+                    bestDistance = lateralDistance
+                    bestAlong = segment.startDistance + (t * segment.len)
+                    bestSigned = signedLateral(segment: segment.v, vectorFromStart: w, distance: lateralDistance)
+                }
+            }
+            if bestDistance <= profileHalf {
+                corridor.append(CorridorPoint(
+                    alongDistance: bestAlong,
+                    lateralDistanceSigned: bestSigned,
+                    elevation: point.y,
+                    color: samplePoint.color
+                ))
+            }
+        }
+
+        var profileSamples: [ProfileSample] = []
+        var profileBinWidth: Float?
+        if !corridor.isEmpty {
+            let targetBinWidth = max(0.01, min(0.05, profileSwath * 0.35))
+            let sampleCount = max(32, min(420, Int(ceil(Double(cumulativeDistance / targetBinWidth))) + 1))
+            let binCount = max(2, sampleCount)
+            let binWidth = cumulativeDistance / Float(binCount - 1)
+            profileBinWidth = binWidth
+            var bins = Array(repeating: [Float](), count: binCount)
+            for sample in corridor {
+                let idx = max(0, min(binCount - 1, Int(floor(sample.alongDistance / max(binWidth, 1e-6)))))
+                bins[idx].append(sample.elevation)
+            }
+            var binElevations = Array<Float?>(repeating: nil, count: binCount)
+            for idx in 0..<binCount where !bins[idx].isEmpty {
+                if path.tool == .elevationProfile {
+                    // Lower percentile reduces spikes from vertical clutter and produces a more natural terrain-like profile.
+                    binElevations[idx] = percentile(bins[idx], fraction: 0.35)
+                } else {
+                    binElevations[idx] = median(bins[idx])
+                }
+            }
+            fillMissing(&binElevations)
+            if binElevations.contains(where: { $0 != nil }) {
+                var values = binElevations.map { $0 ?? 0 }
+                if path.tool == .elevationProfile {
+                    values = smoothSeries(values, radius: 2)
+                    values = smoothSeries(values, radius: 2)
+                }
+                for idx in 0..<binCount {
+                    profileSamples.append(ProfileSample(distance: Float(idx) * binWidth, elevation: values[idx]))
+                }
+            }
+        }
+        if profileSamples.count < 2 {
+            profileSamples = fallbackProfile(for: path.vertices)
+            if profileSamples.count >= 2 {
+                profileBinWidth = max(1e-6, cumulativeDistance / Float(profileSamples.count - 1))
+            }
+        }
+
+        let stats = computeProfileStats(profileSamples)
+        return ComputedAnalysis(
+            profileSamples: profileSamples,
+            corridorPoints: corridor,
+            pathLength: stats.pathLength,
+            swathWidthMeters: path.swathWidthMeters,
+            sourceSampleCount: sampledCloudPoints.count,
+            corridorPointCount: corridor.count,
+            profileBinWidthMeters: profileBinWidth,
+            stationWindowMeters: sectionHalfWindow * 2,
+            minElevation: stats.minElevation,
+            maxElevation: stats.maxElevation,
+            relief: stats.relief,
+            totalRise: stats.totalRise,
+            totalFall: stats.totalFall,
+            averageSlopePercent: stats.averageSlopePercent,
+            maxSlopePercent: stats.maxSlopePercent,
+            stationFraction: 0.5,
+            sectionHalfWindow: sectionHalfWindow
+        )
+    }
+
+    private func sectionScatter(for analysis: ComputedAnalysis) -> [SectionScatterPoint] {
+        guard !analysis.corridorPoints.isEmpty else { return [] }
+        let swath = max(0.04, analysis.swathWidthMeters ?? 0.12)
+        let halfSwath = swath * 0.5
+        let center = analysis.pathLength * analysis.stationFraction
+        return analysis.corridorPoints
+            .filter {
+                abs($0.alongDistance - center) <= analysis.sectionHalfWindow &&
+                abs($0.lateralDistanceSigned) <= halfSwath
+            }
+            .prefix(1200)
+            .map {
+                SectionScatterPoint(
+                    x: $0.lateralDistanceSigned,
+                    y: $0.elevation,
+                    color: $0.color
+                )
+            }
+    }
+
+    private func sectionPointCount(for analysis: ComputedAnalysis) -> Int {
+        guard !analysis.corridorPoints.isEmpty else { return 0 }
+        let swath = max(0.04, analysis.swathWidthMeters ?? 0.12)
+        let halfSwath = swath * 0.5
+        let center = analysis.pathLength * analysis.stationFraction
+        return analysis.corridorPoints.reduce(0) { count, point in
+            let inSection = abs(point.alongDistance - center) <= analysis.sectionHalfWindow &&
+                abs(point.lateralDistanceSigned) <= halfSwath
+            return count + (inSection ? 1 : 0)
+        }
+    }
+
+    private func rebuildCurrentAnalysisCard() {
+        let ids = analysisDisplayOrder()
+        guard !ids.isEmpty else {
+            currentAnalysisCard = nil
+            selectedAnalysisPathID = nil
+            return
+        }
+        if selectedAnalysisPathID == nil || ids.contains(selectedAnalysisPathID!) == false {
+            selectedAnalysisPathID = ids.last
+        }
+        guard let selectedAnalysisPathID,
+              let path = committedPaths.first(where: { $0.id == selectedAnalysisPathID }),
+              let analysis = analysisByPathID[selectedAnalysisPathID],
+              let resultIndex = ids.firstIndex(of: selectedAnalysisPathID),
+              let measurementOrdinal = committedPaths.firstIndex(where: { $0.id == selectedAnalysisPathID }).map({ $0 + 1 }) else {
+            currentAnalysisCard = nil
+            return
+        }
+
+        currentAnalysisCard = AnalysisCardModel(
+            measurementID: selectedAnalysisPathID,
+            measurementOrdinal: measurementOrdinal,
+            tool: path.tool,
+            createdAt: path.createdAt,
+            pathLength: analysis.pathLength,
+            swathWidthMeters: analysis.swathWidthMeters,
+            profileSamples: analysis.profileSamples,
+            sectionScatter: path.tool == .crossSection ? sectionScatter(for: analysis) : [],
+            sectionPointCount: path.tool == .crossSection ? sectionPointCount(for: analysis) : nil,
+            sourceSampleCount: analysis.sourceSampleCount,
+            corridorPointCount: analysis.corridorPointCount,
+            profileBinWidthMeters: analysis.profileBinWidthMeters,
+            stationWindowMeters: analysis.stationWindowMeters,
+            minElevation: analysis.minElevation,
+            maxElevation: analysis.maxElevation,
+            relief: analysis.relief,
+            totalRise: analysis.totalRise,
+            totalFall: analysis.totalFall,
+            averageSlopePercent: analysis.averageSlopePercent,
+            maxSlopePercent: analysis.maxSlopePercent,
+            stationFraction: analysis.stationFraction,
+            canAdjustStation: path.tool == .crossSection,
+            resultIndex: resultIndex + 1,
+            resultCount: ids.count
+        )
+    }
+
+    func exportMeasurements() -> [ScanReportMeasurement] {
+        committedPaths.map { path in
+            let length = totalLength(vertices: path.vertices, closed: false)
+            if path.tool == .path, path.isClosed {
+                let perimeter = totalLength(vertices: path.vertices, closed: true)
+                let area = polygonArea(vertices: path.vertices)
+                return ScanReportMeasurement(
+                    id: path.id.uuidString,
+                    type: .closedArea,
+                    createdAt: path.createdAt,
+                    vertexCount: path.vertices.count,
+                    vertices: path.vertices.map {
+                        ScanReportVertex(x: Double($0.x), y: Double($0.y), z: Double($0.z))
+                    },
+                    lengthMeters: nil,
+                    perimeterMeters: Double(perimeter),
+                    areaSquareMeters: area.map(Double.init),
+                    swathWidthMeters: nil,
+                    minElevationMeters: nil,
+                    maxElevationMeters: nil,
+                    reliefMeters: nil,
+                    totalRiseMeters: nil,
+                    totalFallMeters: nil,
+                    averageSlopePercent: nil,
+                    maxSlopePercent: nil,
+                    notes: nil
+                )
+            }
+
+            let sampledAnalysis = analysisByPathID[path.id]
+            let vertexStats = computeElevationStats(vertices: path.vertices)
+            return ScanReportMeasurement(
+                id: path.id.uuidString,
+                type: reportType(for: path),
+                createdAt: path.createdAt,
+                vertexCount: path.vertices.count,
+                vertices: path.vertices.map {
+                    ScanReportVertex(x: Double($0.x), y: Double($0.y), z: Double($0.z))
+                },
+                lengthMeters: Double(sampledAnalysis?.pathLength ?? length),
+                perimeterMeters: nil,
+                areaSquareMeters: nil,
+                swathWidthMeters: path.swathWidthMeters.map(Double.init),
+                minElevationMeters: (sampledAnalysis?.minElevation).map(Double.init) ?? vertexStats.map { Double($0.minElevation) },
+                maxElevationMeters: (sampledAnalysis?.maxElevation).map(Double.init) ?? vertexStats.map { Double($0.maxElevation) },
+                reliefMeters: (sampledAnalysis?.relief).map(Double.init) ?? vertexStats.map { Double($0.relief) },
+                totalRiseMeters: (sampledAnalysis?.totalRise).map(Double.init) ?? vertexStats.map { Double($0.totalRise) },
+                totalFallMeters: (sampledAnalysis?.totalFall).map(Double.init) ?? vertexStats.map { Double($0.totalFall) },
+                averageSlopePercent: (sampledAnalysis?.averageSlopePercent).map(Double.init) ?? vertexStats.map { Double($0.averageSlopePercent) },
+                maxSlopePercent: (sampledAnalysis?.maxSlopePercent).map(Double.init) ?? vertexStats.map { Double($0.maxSlopePercent) },
+                notes: {
+                    switch path.tool {
+                    case .path: return nil
+                    case .crossSection: return "Sampled cross section"
+                    case .elevationProfile: return "Sampled elevation profile"
+                    }
+                }()
+            )
+        }
     }
 
     func updateFrame(
         viewMatrix: simd_float4x4,
         projectionMatrix: simd_float4x4,
         viewportSize: CGSize,
-        snapPoint: SIMD3<Float>?
+        snapPoint: SIMD3<Float>?,
+        cloudSamplePoints: [CloudSamplePoint]
     ) {
         guard isEnabled else { return }
         self.snapPoint = snapPoint
+        sampledCloudPoints = cloudSamplePoints
         hasSnapPoint = (snapPoint != nil)
         projectedSnapPoint = snapPoint.flatMap {
             project($0, viewMatrix: viewMatrix, projectionMatrix: projectionMatrix, viewportSize: viewportSize)
@@ -521,10 +1648,23 @@ final class MeasureController: ObservableObject {
             viewportSize: viewportSize
         )
 
+        projectedActiveSwathSegments = selectedTool == .crossSection
+            ? makeSwathSegments(
+                vertices: activeVertices,
+                swathWidthMeters: Float(swathWidthMeters),
+                tint: .blue.opacity(0.88),
+                width: 1.0,
+                viewMatrix: viewMatrix,
+                projectionMatrix: projectionMatrix,
+                viewportSize: viewportSize
+            )
+            : []
+
         var committedVertices: [CGPoint] = []
         var committedSegments: [ScreenSegment] = []
-
+        var committedSwathSegments: [ScreenSegment] = []
         var labels: [OverlayLabel] = []
+
         for path in committedPaths {
             committedVertices.append(contentsOf: path.vertices.compactMap {
                 project($0, viewMatrix: viewMatrix, projectionMatrix: projectionMatrix, viewportSize: viewportSize)
@@ -532,23 +1672,41 @@ final class MeasureController: ObservableObject {
             committedSegments.append(contentsOf: makeSegments(
                 vertices: path.vertices,
                 closed: path.isClosed,
-                tint: .white.opacity(0.9),
+                tint: path.tool == .path ? .white.opacity(0.9) : (path.tool == .crossSection ? .blue.opacity(0.9) : .orange.opacity(0.9)),
                 width: 1.6,
                 viewMatrix: viewMatrix,
                 projectionMatrix: projectionMatrix,
                 viewportSize: viewportSize
             ))
-            labels.append(contentsOf: segmentLabels(
-                for: path.vertices,
-                closed: path.isClosed,
-                tint: .white,
-                viewMatrix: viewMatrix,
-                projectionMatrix: projectionMatrix,
-                viewportSize: viewportSize
-            ))
+
+            if path.tool == .crossSection {
+                committedSwathSegments.append(contentsOf: makeSwathSegments(
+                    vertices: path.vertices,
+                    swathWidthMeters: path.swathWidthMeters ?? Float(swathWidthMeters),
+                    tint: .blue.opacity(0.84),
+                    width: 1.0,
+                    viewMatrix: viewMatrix,
+                    projectionMatrix: projectionMatrix,
+                    viewportSize: viewportSize
+                ))
+            }
+
+            if path.tool == .path {
+                labels.append(contentsOf: segmentLabels(
+                    for: path.vertices,
+                    closed: path.isClosed,
+                    tint: .white,
+                    viewMatrix: viewMatrix,
+                    projectionMatrix: projectionMatrix,
+                    viewportSize: viewportSize
+                ))
+            }
+
             if let summary = summaryLabel(
                 for: path.vertices,
                 closed: path.isClosed,
+                tool: path.tool,
+                swathWidthMeters: path.swathWidthMeters,
                 tint: .white,
                 viewMatrix: viewMatrix,
                 projectionMatrix: projectionMatrix,
@@ -557,20 +1715,27 @@ final class MeasureController: ObservableObject {
                 labels.append(summary)
             }
         }
+
         projectedCommittedVertices = committedVertices
         projectedCommittedSegments = committedSegments
+        projectedCommittedSwathSegments = committedSwathSegments
 
-        labels.append(contentsOf: segmentLabels(
-            for: activeVertices,
-            closed: false,
-            tint: .blue,
-            viewMatrix: viewMatrix,
-            projectionMatrix: projectionMatrix,
-            viewportSize: viewportSize
-        ))
+        if selectedTool == .path {
+            labels.append(contentsOf: segmentLabels(
+                for: activeVertices,
+                closed: false,
+                tint: .blue,
+                viewMatrix: viewMatrix,
+                projectionMatrix: projectionMatrix,
+                viewportSize: viewportSize
+            ))
+        }
+
         if let activeSummary = summaryLabel(
             for: activeVertices,
             closed: false,
+            tool: selectedTool,
+            swathWidthMeters: selectedTool == .crossSection ? Float(swathWidthMeters) : nil,
             tint: .blue,
             viewMatrix: viewMatrix,
             projectionMatrix: projectionMatrix,
@@ -657,9 +1822,118 @@ final class MeasureController: ObservableObject {
         return segments
     }
 
+    private func makeSwathSegments(
+        vertices: [SIMD3<Float>],
+        swathWidthMeters: Float,
+        tint: Color,
+        width: CGFloat,
+        viewMatrix: simd_float4x4,
+        projectionMatrix: simd_float4x4,
+        viewportSize: CGSize
+    ) -> [ScreenSegment] {
+        guard vertices.count >= 2 else { return [] }
+        let halfSwathMeters = max(0.005, swathWidthMeters * 0.5)
+
+        struct SegmentBasis {
+            let normal: CGPoint
+            let pixelsPerMeter: CGFloat
+        }
+
+        var projected: [CGPoint] = []
+        projected.reserveCapacity(vertices.count)
+        for vertex in vertices {
+            guard let point = project(vertex, viewMatrix: viewMatrix, projectionMatrix: projectionMatrix, viewportSize: viewportSize) else {
+                return []
+            }
+            projected.append(point)
+        }
+
+        var basisBySegment: [SegmentBasis] = []
+        basisBySegment.reserveCapacity(max(0, vertices.count - 1))
+        for idx in 1..<vertices.count {
+            let worldA = vertices[idx - 1]
+            let worldB = vertices[idx]
+            let a = projected[idx - 1]
+            let b = projected[idx]
+
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let screenLength = hypot(dx, dy)
+            let worldLength = CGFloat(simd_distance(worldA, worldB))
+            guard screenLength > 0.0001, worldLength > 0.0001 else { continue }
+
+            let tx = dx / screenLength
+            let ty = dy / screenLength
+            let nx = -ty
+            let ny = tx
+            basisBySegment.append(
+                SegmentBasis(
+                    normal: CGPoint(x: nx, y: ny),
+                    pixelsPerMeter: screenLength / worldLength
+                )
+            )
+        }
+
+        guard basisBySegment.count == vertices.count - 1 else { return [] }
+
+        var left: [CGPoint] = []
+        var right: [CGPoint] = []
+        left.reserveCapacity(vertices.count)
+        right.reserveCapacity(vertices.count)
+
+        for idx in 0..<vertices.count {
+            let base = projected[idx]
+            let normal: CGPoint
+            let ppm: CGFloat
+
+            if idx == 0 {
+                normal = basisBySegment[0].normal
+                ppm = basisBySegment[0].pixelsPerMeter
+            } else if idx == vertices.count - 1 {
+                normal = basisBySegment[basisBySegment.count - 1].normal
+                ppm = basisBySegment[basisBySegment.count - 1].pixelsPerMeter
+            } else {
+                let prev = basisBySegment[idx - 1]
+                let next = basisBySegment[idx]
+                let avgNX = prev.normal.x + next.normal.x
+                let avgNY = prev.normal.y + next.normal.y
+                let nLen = hypot(avgNX, avgNY)
+                if nLen > 0.0001 {
+                    normal = CGPoint(x: avgNX / nLen, y: avgNY / nLen)
+                } else {
+                    normal = next.normal
+                }
+                ppm = (prev.pixelsPerMeter + next.pixelsPerMeter) * 0.5
+            }
+
+            let offset = CGFloat(halfSwathMeters) * ppm
+            let ox = normal.x * offset
+            let oy = normal.y * offset
+            left.append(CGPoint(x: base.x + ox, y: base.y + oy))
+            right.append(CGPoint(x: base.x - ox, y: base.y - oy))
+        }
+
+        var segments: [ScreenSegment] = []
+        segments.reserveCapacity((vertices.count - 1) * 2 + 2)
+        for idx in 1..<vertices.count {
+            segments.append(ScreenSegment(a: left[idx - 1], b: left[idx], tint: tint, width: width))
+            segments.append(ScreenSegment(a: right[idx - 1], b: right[idx], tint: tint, width: width))
+        }
+
+        if let firstLeft = left.first, let firstRight = right.first,
+           let lastLeft = left.last, let lastRight = right.last {
+            segments.append(ScreenSegment(a: firstLeft, b: firstRight, tint: tint.opacity(0.55), width: width))
+            segments.append(ScreenSegment(a: lastLeft, b: lastRight, tint: tint.opacity(0.55), width: width))
+        }
+
+        return segments
+    }
+
     private func summaryLabel(
         for vertices: [SIMD3<Float>],
         closed: Bool,
+        tool: MeasureTool,
+        swathWidthMeters: Float?,
         tint: Color,
         viewMatrix: simd_float4x4,
         projectionMatrix: simd_float4x4,
@@ -668,9 +1942,26 @@ final class MeasureController: ObservableObject {
         guard vertices.count >= 2 else { return nil }
         let total = totalLength(vertices: vertices, closed: closed)
 
-        var text = "L \(String(format: "%.2f", total))m"
-        if closed, let area = polygonArea(vertices: vertices) {
-            text = "P \(String(format: "%.2f", total))m • A \(String(format: "%.2f", area))m²"
+        let text: String
+        switch tool {
+        case .path:
+            if closed, let area = polygonArea(vertices: vertices) {
+                text = "P \(String(format: "%.2f", total))m • A \(String(format: "%.2f", area))m²"
+            } else {
+                text = "L \(String(format: "%.2f", total))m"
+            }
+        case .crossSection:
+            if let stats = computeElevationStats(vertices: vertices) {
+                text = "CS L \(String(format: "%.2f", total))m • W \(String(format: "%.2f", swathWidthMeters ?? 0))m • R \(String(format: "%.2f", stats.relief))m"
+            } else {
+                text = "CS L \(String(format: "%.2f", total))m • W \(String(format: "%.2f", swathWidthMeters ?? 0))m"
+            }
+        case .elevationProfile:
+            if let stats = computeElevationStats(vertices: vertices) {
+                text = "EP L \(String(format: "%.2f", total))m • dZ \(String(format: "%.2f", stats.relief))m"
+            } else {
+                text = "EP L \(String(format: "%.2f", total))m"
+            }
         }
 
         let centroid = vertices.reduce(SIMD3<Float>(repeating: 0), +) / Float(vertices.count)
@@ -769,6 +2060,7 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     let device: MTLDevice
     let engine: PointCloudEngine
     let isRenderingPaused: Bool
+    let recenterSignal: Int
     let measureController: MeasureController
     
     func makeUIView(context: Context) -> MTKView {
@@ -789,6 +2081,7 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     
     func updateUIView(_ uiView: MTKView, context: Context) {
         uiView.isPaused = isRenderingPaused
+        context.coordinator.updateRecenterSignal(recenterSignal)
         // Setup gestures if not already done
         if uiView.gestureRecognizers?.isEmpty ?? true {
             context.coordinator.setupGestures(for: uiView)
@@ -800,12 +2093,33 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     }
     
     class Coordinator: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate {
+        private struct VoxelMirror {
+            var positionAndConfidence: SIMD4<Float>
+            var colorAndSampleCount: SIMD4<Float>
+        }
+
+        private struct CameraPose {
+            let target: SIMD3<Float>
+            let distance: Float
+            let pitch: Float
+            let yaw: Float
+            let roll: Float
+        }
+
+        private struct CameraAnimation {
+            let from: CameraPose
+            let to: CameraPose
+            let startTime: CFTimeInterval
+            let duration: CFTimeInterval
+        }
+
         private let device: MTLDevice
         private let engine: PointCloudEngine
         private let measureController: MeasureController
         private let commandQueue: MTLCommandQueue
         private var pipelineState: MTLRenderPipelineState!
         private var depthStencilState: MTLDepthStencilState!
+        private let cameraFOVDegrees: Float = 60.0
         
         // Orbit camera state
         private var cameraDistance: Float = 2.0
@@ -813,8 +2127,12 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         private var cameraYaw: Float = 0.0
         private var cameraRoll: Float = 0.0
         private var orbitTarget: SIMD3<Float> = .zero
+        private var shouldAutoFit = true
+        private var pendingManualRecenter = false
+        private var lastRecenterSignal = 0
+        private var cameraAnimation: CameraAnimation?
 
-        private var sampledPoints: [SIMD3<Float>] = []
+        private var sampledPoints: [MeasureController.CloudSamplePoint] = []
         private var lastSamplePointCount: Int = -1
         private var lastSampleRefreshTime: TimeInterval = 0
         
@@ -856,16 +2174,35 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             depthDesc.isDepthWriteEnabled = true
             depthStencilState = device.makeDepthStencilState(descriptor: depthDesc)!
         }
+
+        func updateRecenterSignal(_ signal: Int) {
+            guard signal != lastRecenterSignal else { return }
+            lastRecenterSignal = signal
+            pendingManualRecenter = true
+        }
         
         func draw(in view: MTKView) {
             guard let renderPassDescriptor = view.currentRenderPassDescriptor,
                   let commandBuffer = commandQueue.makeCommandBuffer(),
                   let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else { return }
+
+            if engine.activePointCount == 0 {
+                shouldAutoFit = true
+            }
+
+            if pendingManualRecenter {
+                pendingManualRecenter = false
+                shouldAutoFit = !recenterCameraToPointCloud(viewportSize: view.bounds.size, animated: true)
+            } else if shouldAutoFit && engine.activePointCount > 0 {
+                shouldAutoFit = !recenterCameraToPointCloud(viewportSize: view.bounds.size, animated: true)
+            }
+
+            updateCameraAnimationIfNeeded()
             
             // Build orbit camera matrices
             let viewMatrix = makeOrbitViewMatrix()
-            let aspect = Float(view.bounds.width / view.bounds.height)
-            let projectionMatrix = makeProjectionMatrix(aspect: aspect, fov: 60.0, near: 0.01, far: 100.0)
+            let aspect = max(Float(view.bounds.width / max(1, view.bounds.height)), 0.2)
+            let projectionMatrix = makeProjectionMatrix(aspect: aspect, fov: cameraFOVDegrees, near: 0.01, far: 100.0)
 
             if measureController.isEnabled {
                 refreshPointSamplesIfNeeded()
@@ -880,7 +2217,8 @@ struct PointCloudViewerMetal: UIViewRepresentable {
                         viewMatrix: viewMatrix,
                         projectionMatrix: projectionMatrix,
                         viewportSize: view.bounds.size,
-                        snapPoint: snapPoint
+                        snapPoint: snapPoint,
+                        cloudSamplePoints: self.sampledPoints
                     )
                 }
                 if Thread.isMainThread {
@@ -959,33 +2297,170 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             )
         }
 
-        private func refreshPointSamplesIfNeeded() {
-            let now = CACurrentMediaTime()
-            let shouldRefreshByCount = abs(engine.activePointCount - lastSamplePointCount) > 400
-            let shouldRefreshByTime = (now - lastSampleRefreshTime) > 0.12
-            guard shouldRefreshByCount || shouldRefreshByTime || sampledPoints.isEmpty else { return }
+        @discardableResult
+        private func recenterCameraToPointCloud(viewportSize: CGSize, animated: Bool) -> Bool {
+            guard let bounds = computePointCloudBounds() else { return false }
 
-            struct VoxelMirror {
-                var positionAndConfidence: SIMD4<Float>
-                var colorAndSampleCount: SIMD4<Float>
+            let minPoint = bounds.min
+            let maxPoint = bounds.max
+            let center = (minPoint + maxPoint) * 0.5
+            let halfExtents = (maxPoint - minPoint) * 0.5
+            var radius = simd_length(halfExtents)
+            if !radius.isFinite || radius < 0.02 {
+                radius = 0.02
             }
 
-            let targetSampleCount = 24_000
-            let divisor = max(1, min(targetSampleCount, max(1, engine.activePointCount)))
-            let step = max(1, engine.maxVoxels / divisor)
+            let safeAspect = max(Float(viewportSize.width / max(1, viewportSize.height)), 0.2)
+            let verticalHalfFOV = (cameraFOVDegrees * .pi / 180.0) * 0.5
+            let horizontalHalfFOV = atan(tan(verticalHalfFOV) * safeAspect)
+            let limitingHalfFOV = max(min(verticalHalfFOV, horizontalHalfFOV), 0.08)
+
+            let framingPadding: Float = 1.18
+            let targetDistance = max(
+                0.12,
+                min(30.0, (radius / tan(limitingHalfFOV)) * framingPadding)
+            )
+
+            let targetPose = CameraPose(
+                target: center,
+                distance: targetDistance,
+                pitch: 0.3,
+                yaw: 0.0,
+                roll: 0.0
+            )
+            if animated {
+                startCameraAnimation(to: targetPose, duration: 0.28)
+            } else {
+                applyCameraPose(targetPose)
+            }
+            return true
+        }
+
+        private func currentCameraPose() -> CameraPose {
+            CameraPose(
+                target: orbitTarget,
+                distance: cameraDistance,
+                pitch: cameraPitch,
+                yaw: cameraYaw,
+                roll: cameraRoll
+            )
+        }
+
+        private func applyCameraPose(_ pose: CameraPose) {
+            orbitTarget = pose.target
+            cameraDistance = pose.distance
+            cameraPitch = pose.pitch
+            cameraYaw = pose.yaw
+            cameraRoll = pose.roll
+        }
+
+        private func startCameraAnimation(to target: CameraPose, duration: CFTimeInterval) {
+            updateCameraAnimationIfNeeded()
+            let startPose = currentCameraPose()
+            cameraAnimation = CameraAnimation(
+                from: startPose,
+                to: target,
+                startTime: CACurrentMediaTime(),
+                duration: max(0.05, duration)
+            )
+        }
+
+        private func cancelCameraAnimation() {
+            cameraAnimation = nil
+        }
+
+        private func updateCameraAnimationIfNeeded() {
+            guard let animation = cameraAnimation else { return }
+            let elapsed = CACurrentMediaTime() - animation.startTime
+            let t = min(max(elapsed / animation.duration, 0), 1)
+            let eased = easeOutCubic(Float(t))
+
+            let interpolated = CameraPose(
+                target: simd_mix(animation.from.target, animation.to.target, SIMD3<Float>(repeating: eased)),
+                distance: animation.from.distance + (animation.to.distance - animation.from.distance) * eased,
+                pitch: animation.from.pitch + (animation.to.pitch - animation.from.pitch) * eased,
+                yaw: animation.from.yaw + (animation.to.yaw - animation.from.yaw) * eased,
+                roll: animation.from.roll + (animation.to.roll - animation.from.roll) * eased
+            )
+            applyCameraPose(interpolated)
+
+            if t >= 1 {
+                applyCameraPose(animation.to)
+                cameraAnimation = nil
+            }
+        }
+
+        private func easeOutCubic(_ t: Float) -> Float {
+            let inv = 1 - t
+            return 1 - (inv * inv * inv)
+        }
+
+        private func computePointCloudBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+            let voxels = engine.voxelBuffer.contents().assumingMemoryBound(to: VoxelMirror.self)
+            var hasAnyPoint = false
+            var minPoint = SIMD3<Float>(repeating: 0)
+            var maxPoint = SIMD3<Float>(repeating: 0)
+
+            for idx in 0..<engine.maxVoxels {
+                let voxel = voxels[idx]
+                if voxel.colorAndSampleCount.w <= 0 { continue }
+
+                let point = SIMD3<Float>(
+                    voxel.positionAndConfidence.x,
+                    voxel.positionAndConfidence.y,
+                    voxel.positionAndConfidence.z
+                )
+                if !hasAnyPoint {
+                    minPoint = point
+                    maxPoint = point
+                    hasAnyPoint = true
+                } else {
+                    minPoint = simd_min(minPoint, point)
+                    maxPoint = simd_max(maxPoint, point)
+                }
+            }
+
+            return hasAnyPoint ? (minPoint, maxPoint) : nil
+        }
+
+        private func refreshPointSamplesIfNeeded() {
+            let now = CACurrentMediaTime()
+            let activeCount = max(1, engine.activePointCount)
+            let refreshInterval: TimeInterval = activeCount < 120_000 ? 0.22 : 0.12
+            let shouldRefreshByCount = abs(engine.activePointCount - lastSamplePointCount) > 400
+            let shouldRefreshByTime = (now - lastSampleRefreshTime) > refreshInterval
+            guard shouldRefreshByCount || shouldRefreshByTime || sampledPoints.isEmpty else { return }
+
+            func normalizeColor(_ value: Float) -> Float {
+                let scaled = value <= 1.0 ? (value * 255.0) : value
+                return max(0, min(255, scaled)) / 255.0
+            }
+
+            let targetSampleCount = 48_000
+            let step = max(1, activeCount / targetSampleCount)
             let voxels = engine.voxelBuffer.contents().assumingMemoryBound(to: VoxelMirror.self)
 
-            var newSampled: [SIMD3<Float>] = []
-            newSampled.reserveCapacity(min(targetSampleCount, max(1, engine.activePointCount)))
+            var newSampled: [MeasureController.CloudSamplePoint] = []
+            newSampled.reserveCapacity(min(targetSampleCount, activeCount))
 
             for idx in stride(from: 0, to: engine.maxVoxels, by: step) {
                 let voxel = voxels[idx]
                 if voxel.colorAndSampleCount.w <= 0 { continue }
-                newSampled.append(SIMD3<Float>(
-                    voxel.positionAndConfidence.x,
-                    voxel.positionAndConfidence.y,
-                    voxel.positionAndConfidence.z
-                ))
+                newSampled.append(
+                    MeasureController.CloudSamplePoint(
+                        position: SIMD3<Float>(
+                            voxel.positionAndConfidence.x,
+                            voxel.positionAndConfidence.y,
+                            voxel.positionAndConfidence.z
+                        ),
+                        color: SIMD3<Float>(
+                            normalizeColor(voxel.colorAndSampleCount.x),
+                            normalizeColor(voxel.colorAndSampleCount.y),
+                            normalizeColor(voxel.colorAndSampleCount.z)
+                        )
+                    )
+                )
+                if newSampled.count >= targetSampleCount { break }
             }
 
             sampledPoints = newSampled
@@ -1009,7 +2484,8 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             var bestDistSquared = CGFloat.greatestFiniteMagnitude
             var bestDepth = Float.greatestFiniteMagnitude
 
-            for point in sampledPoints {
+            for sample in sampledPoints {
+                let point = sample.position
                 let clip = viewProjection * SIMD4<Float>(point.x, point.y, point.z, 1)
                 if clip.w <= 0 { continue }
                 let ndc = clip / clip.w
@@ -1054,6 +2530,7 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         }
         
         @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+            cancelCameraAnimation()
             let translation = gesture.translation(in: gesture.view)
             
             if gesture.numberOfTouches == 1 {
@@ -1078,12 +2555,14 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         }
         
         @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+            cancelCameraAnimation()
             cameraDistance /= Float(gesture.scale)
             cameraDistance = max(0.12, min(30.0, cameraDistance))  // Wider zoom range for detailed picking
             gesture.scale = 1.0
         }
 
         @objc private func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+            cancelCameraAnimation()
             // Incremental twist delta; reset each frame for stable, low-latency roll control.
             let delta = Float(gesture.rotation)
             gesture.rotation = 0

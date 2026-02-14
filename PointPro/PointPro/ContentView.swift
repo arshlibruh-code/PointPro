@@ -22,7 +22,7 @@ struct ContentView: View {
     var stopScanSignal: Int = 0
     var openViewerSignal: Int = 0
     var viewerSession: ScanSession? = nil
-    var onSnapshotSaved: ((Data, Int) -> Void)? = nil
+    var onSnapshotSaved: ((Data, Int, ScanCaptureMetadata?) -> Void)? = nil
     var onPrepareViewer: ((PointCloudEngine) -> Void)? = nil
     var onViewerDismissed: (() -> Void)? = nil
     var onViewerContinue: (() -> Void)? = nil
@@ -75,24 +75,116 @@ struct ContentView: View {
             onViewerDismissed?()
         }) {
             if let device = MTLCreateSystemDefaultDevice() {
+                let viewerCaptureMetadata = loadCaptureMetadata(for: viewerSession)
                 PointCloudViewer(
                     engine: arManager.pointCloudEngine,
                     device: device,
                     session: viewerSession,
-                    onExport: { session, format, progress, isCancelled in
+                    captureMetadata: viewerCaptureMetadata,
+                    onExport: { session, format, measurements, progress, isCancelled in
+                        func mapProgress(_ start: Double, _ end: Double) -> (Double, String) -> Void {
+                            { fraction, message in
+                                let clamped = min(max(fraction, 0), 1)
+                                progress(start + ((end - start) * clamped), message)
+                            }
+                        }
+
                         guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
                         let snapshotURL = docs
                             .appendingPathComponent("scans", isDirectory: true)
                             .appendingPathComponent("\(session.id.uuidString).pcraw")
                         guard let snapshotData = try? Data(contentsOf: snapshotURL) else { return nil }
-                        return arManager.pointCloudEngine.exportPLYFile(
-                            fromSnapshot: snapshotData,
-                            pointCount: session.pointCount,
-                            suggestedName: session.name,
-                            format: format,
-                            progress: progress,
-                            isCancelled: isCancelled
-                        )
+                        let captureMetadata = loadCaptureMetadata(for: session) ?? viewerCaptureMetadata
+                        switch format {
+                        case .laz:
+                            guard var artifact = arManager.pointCloudEngine.exportLAZFile(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                suggestedName: session.name,
+                                session: session,
+                                captureMetadata: captureMetadata,
+                                progress: mapProgress(0.02, 0.60),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            guard let reportURL = arManager.pointCloudEngine.generateExportReportPDF(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                session: session,
+                                captureMetadata: captureMetadata,
+                                exportFormat: format,
+                                primaryURL: artifact.primaryURL,
+                                sidecarURL: artifact.sidecarURL,
+                                measurements: measurements,
+                                progress: mapProgress(0.60, 0.97),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            artifact.additionalURLs.append(reportURL)
+                            progress(0.985, "Preparing share sheet...")
+                            return artifact
+                        case .plyBinaryLittleEndian:
+                            guard let url = arManager.pointCloudEngine.exportPLYFile(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                suggestedName: session.name,
+                                format: .binaryLittleEndian,
+                                progress: mapProgress(0.02, 0.55),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            var artifact = PointCloudEngine.ExportArtifact(primaryURL: url, sidecarURL: nil)
+                            guard let reportURL = arManager.pointCloudEngine.generateExportReportPDF(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                session: session,
+                                captureMetadata: captureMetadata,
+                                exportFormat: format,
+                                primaryURL: url,
+                                sidecarURL: nil,
+                                measurements: measurements,
+                                progress: mapProgress(0.55, 0.97),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            artifact.additionalURLs.append(reportURL)
+                            progress(0.985, "Preparing share sheet...")
+                            return artifact
+                        case .plyAscii:
+                            guard let url = arManager.pointCloudEngine.exportPLYFile(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                suggestedName: session.name,
+                                format: .ascii,
+                                progress: mapProgress(0.02, 0.55),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            var artifact = PointCloudEngine.ExportArtifact(primaryURL: url, sidecarURL: nil)
+                            guard let reportURL = arManager.pointCloudEngine.generateExportReportPDF(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                session: session,
+                                captureMetadata: captureMetadata,
+                                exportFormat: format,
+                                primaryURL: url,
+                                sidecarURL: nil,
+                                measurements: measurements,
+                                progress: mapProgress(0.55, 0.97),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                                artifact.additionalURLs.append(reportURL)
+                            progress(0.985, "Preparing share sheet...")
+                            return artifact
+                        case .pdfReport:
+                            guard let reportURL = arManager.pointCloudEngine.exportReportPDFOnly(
+                                fromSnapshot: snapshotData,
+                                pointCount: session.pointCount,
+                                suggestedName: session.name,
+                                session: session,
+                                captureMetadata: captureMetadata,
+                                measurements: measurements,
+                                progress: mapProgress(0.05, 0.97),
+                                isCancelled: isCancelled
+                            ) else { return nil }
+                            progress(0.985, "Preparing share sheet...")
+                            return .init(primaryURL: reportURL, sidecarURL: nil)
+                        }
                     },
                     onContinue: {
                         onViewerContinue?()
@@ -144,7 +236,26 @@ struct ContentView: View {
         }
         .onChange(of: saveSnapshotSignal) { _, _ in
             let snapshot = arManager.pointCloudEngine.makeSnapshot()
-            onSnapshotSaved?(snapshot.data, snapshot.pointCount)
+            let worldOrigin = arManager.pointCloudEngine.getWorldOriginTransform()
+            let flattenedTransform: [Float] = [
+                worldOrigin.columns.0.x, worldOrigin.columns.0.y, worldOrigin.columns.0.z, worldOrigin.columns.0.w,
+                worldOrigin.columns.1.x, worldOrigin.columns.1.y, worldOrigin.columns.1.z, worldOrigin.columns.1.w,
+                worldOrigin.columns.2.x, worldOrigin.columns.2.y, worldOrigin.columns.2.z, worldOrigin.columns.2.w,
+                worldOrigin.columns.3.x, worldOrigin.columns.3.y, worldOrigin.columns.3.z, worldOrigin.columns.3.w,
+            ]
+            let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            let metadata = ScanCaptureMetadata(
+                capturedAt: Date(),
+                worldOriginTransform: flattenedTransform,
+                location: arManager.latestLocationMetadata,
+                deviceModel: UIDevice.current.model,
+                systemName: UIDevice.current.systemName,
+                systemVersion: UIDevice.current.systemVersion,
+                appVersion: appVersion,
+                depthResolution: [arManager.depthWidth, arManager.depthHeight],
+                colorResolution: [arManager.imageWidth, arManager.imageHeight]
+            )
+            onSnapshotSaved?(snapshot.data, snapshot.pointCount, metadata)
         }
         .onChange(of: stopScanSignal) { _, _ in
             if arManager.isScanning {
@@ -162,6 +273,16 @@ struct ContentView: View {
             }
             onCameraReady?()
         }
+    }
+
+    private func loadCaptureMetadata(for session: ScanSession?) -> ScanCaptureMetadata? {
+        guard let session else { return nil }
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let metadataURL = docs
+            .appendingPathComponent("scans", isDirectory: true)
+            .appendingPathComponent("\(session.id.uuidString).meta.json")
+        guard let data = try? Data(contentsOf: metadataURL) else { return nil }
+        return try? JSONDecoder().decode(ScanCaptureMetadata.self, from: data)
     }
 }
 
