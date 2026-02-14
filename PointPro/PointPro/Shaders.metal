@@ -110,10 +110,58 @@ struct VertexOut {
     float pointSize [[point_size]];
 };
 
+struct RenderColorUniforms {
+    uint mode;           // 0:auto, 1:rgb, 2:elevation, 3:intensity, 4:classification
+    uint hasUsableRGB;   // 0/1
+    float minElevation;
+    float maxElevation;
+    float minIntensity;
+    float maxIntensity;
+};
+
+float3 viridis(float t)
+{
+    t = clamp(t, 0.0, 1.0);
+    const float3 c0 = float3(0.267, 0.005, 0.329);
+    const float3 c1 = float3(0.230, 0.322, 0.546);
+    const float3 c2 = float3(0.128, 0.567, 0.551);
+    const float3 c3 = float3(0.369, 0.789, 0.383);
+    const float3 c4 = float3(0.993, 0.906, 0.144);
+
+    if (t < 0.25) {
+        return mix(c0, c1, t / 0.25);
+    } else if (t < 0.5) {
+        return mix(c1, c2, (t - 0.25) / 0.25);
+    } else if (t < 0.75) {
+        return mix(c2, c3, (t - 0.5) / 0.25);
+    }
+    return mix(c3, c4, (t - 0.75) / 0.25);
+}
+
+float3 classificationColor(float c)
+{
+    int cls = clamp(int(round(c * 255.0)), 0, 255);
+    switch (cls)
+    {
+        case 1: return float3(0.85, 0.85, 0.85); // Unclassified
+        case 2: return float3(0.70, 0.50, 0.30); // Ground
+        case 3: return float3(0.40, 0.75, 0.30); // Low vegetation
+        case 4: return float3(0.20, 0.65, 0.25); // Medium vegetation
+        case 5: return float3(0.10, 0.45, 0.18); // High vegetation
+        case 6: return float3(0.90, 0.55, 0.20); // Building
+        case 7: return float3(0.88, 0.25, 0.25); // Low noise
+        case 9: return float3(0.20, 0.45, 0.90); // Water
+        case 17: return float3(0.76, 0.66, 0.50); // Bridge deck
+        case 18: return float3(1.00, 0.10, 0.70); // High noise
+        default: return float3(0.62, 0.62, 0.62);
+    }
+}
+
 vertex VertexOut pointVertex(
     uint vid [[vertex_id]],
     device const Voxel* voxelGrid [[buffer(0)]],
-    constant float4x4& vpMatrix [[buffer(1)]]
+    constant float4x4& vpMatrix [[buffer(1)]],
+    constant RenderColorUniforms& colorUniforms [[buffer(2)]]
 ) {
     VertexOut out;
     Voxel v = voxelGrid[vid];
@@ -123,7 +171,26 @@ vertex VertexOut pointVertex(
         out.pointSize = 0;
     } else {
         out.position = vpMatrix * float4(v.positionAndConfidence.xyz, 1.0);
-        out.color = v.colorAndSampleCount.xyz;
+        uint mode = colorUniforms.mode;
+        if (mode == 0) {
+            mode = (colorUniforms.hasUsableRGB > 0) ? 1 : 2;
+        }
+
+        float3 color = v.colorAndSampleCount.xyz;
+        if (mode == 2) {
+            float span = max(0.0001, colorUniforms.maxElevation - colorUniforms.minElevation);
+            float t = (v.positionAndConfidence.y - colorUniforms.minElevation) / span;
+            color = viridis(t);
+        } else if (mode == 3) {
+            float span = max(0.0001, colorUniforms.maxIntensity - colorUniforms.minIntensity);
+            float t = (v.positionAndConfidence.w - colorUniforms.minIntensity) / span;
+            color = float3(t, t, t);
+        } else if (mode == 4) {
+            float clsNormalized = clamp((v.colorAndSampleCount.w - 1.0) / 255.0, 0.0, 1.0);
+            color = classificationColor(clsNormalized);
+        }
+
+        out.color = clamp(color, 0.0, 1.0);
         out.pointSize = 5.0; // Optimized for high-density capture
     }
     return out;

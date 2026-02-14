@@ -55,6 +55,8 @@ struct SessionsHomeView: View {
                     if let id = activeSessionID,
                        let loaded = store.loadPointCloud(for: id) {
                         engine.loadSnapshot(loaded.data, pointCount: loaded.pointCount)
+                    } else {
+                        engine.clearBuffer()
                     }
                 },
                 onViewerDismissed: {
@@ -180,6 +182,23 @@ struct SessionsHomeView: View {
             }
             .tint(.gray)
             .buttonStyle(.glass)
+
+            if !showScansSheet {
+                Button(action: {
+                    emitTapHaptic()
+                    openURLImportViewer()
+                }) {
+                    HStack {
+                        Image(systemName: "link.badge.plus")
+                        Text("LOAD URL")
+                    }
+                    .font(.system(.subheadline, design: .monospaced).bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                }
+                .tint(.gray)
+                .buttonStyle(.glass)
+            }
 
         case .recording:
             HStack(spacing: 10) {
@@ -341,6 +360,14 @@ struct SessionsHomeView: View {
     private func emitTapHaptic() {
         tapHaptic.prepare()
         tapHaptic.impactOccurred(intensity: 1.0)
+    }
+
+    private func openURLImportViewer() {
+        flowState = .idle
+        viewerOpenedFromStop = false
+        activeSessionID = nil
+        clearScanSignal += 1
+        openViewerSignal += 1
     }
 }
 
