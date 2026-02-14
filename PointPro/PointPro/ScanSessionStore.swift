@@ -97,15 +97,22 @@ final class ScanSessionStore: ObservableObject {
         sessions.removeAll(where: { $0.id == id })
         lastPointCountUpdateBySession.removeValue(forKey: id)
         try? FileManager.default.removeItem(at: artifactURL(for: id))
+        try? FileManager.default.removeItem(at: metadataURL(for: id))
         save()
     }
 
-    func savePointCloud(_ data: Data, pointCount: Int, for id: UUID) {
+    func savePointCloud(_ data: Data, pointCount: Int, for id: UUID, metadata: ScanCaptureMetadata?) {
         guard let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         ensureScansDirectory()
         let url = artifactURL(for: id)
         do {
             try data.write(to: url, options: .atomic)
+            if let metadata {
+                let encoded = try encoder.encode(metadata)
+                try encoded.write(to: metadataURL(for: id), options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: metadataURL(for: id))
+            }
             sessions[idx].pointCount = pointCount
             sessions[idx].dataSizeBytes = Int64(data.count)
             sessions[idx].updatedAt = Date()
@@ -122,6 +129,12 @@ final class ScanSessionStore: ObservableObject {
         let url = artifactURL(for: id)
         guard let data = try? Data(contentsOf: url) else { return nil }
         return (data, session.pointCount)
+    }
+
+    func loadCaptureMetadata(for id: UUID) -> ScanCaptureMetadata? {
+        let url = metadataURL(for: id)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? decoder.decode(ScanCaptureMetadata.self, from: data)
     }
 
     private func loadAsync() {
@@ -171,6 +184,10 @@ final class ScanSessionStore: ObservableObject {
 
     private func artifactURL(for id: UUID) -> URL {
         scansDirectoryURL.appendingPathComponent("\(id.uuidString).pcraw")
+    }
+
+    private func metadataURL(for id: UUID) -> URL {
+        scansDirectoryURL.appendingPathComponent("\(id.uuidString).meta.json")
     }
 
     private func ensureScansDirectory() {

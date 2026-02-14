@@ -43,9 +43,9 @@ struct SessionsHomeView: View {
                 stopScanSignal: stopScanSignal,
                 openViewerSignal: openViewerSignal,
                 viewerSession: activeSessionID.flatMap { store.session(with: $0) },
-                onSnapshotSaved: { data, pointCount in
+                onSnapshotSaved: { data, pointCount, metadata in
                     if let id = activeSessionID {
-                        store.savePointCloud(data, pointCount: pointCount, for: id)
+                        store.savePointCloud(data, pointCount: pointCount, for: id, metadata: metadata)
                     }
                 },
                 onPrepareViewer: { engine in

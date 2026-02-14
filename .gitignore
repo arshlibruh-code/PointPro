@@ -14,3 +14,10 @@ build/
 # Swift Package Manager
 .swiftpm/
 .build/
+
+# local sample/project artifacts
+*.psx
+*.files/
+
+# root local design/export asset (not app asset catalog)
+/point-pro-app-icon-load.png
