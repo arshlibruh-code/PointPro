@@ -12,6 +12,66 @@ import MetalKit
 import Combine
 import UIKit
 
+private final class URLImportDownloadDelegate: NSObject, URLSessionDownloadDelegate, URLSessionTaskDelegate {
+    private let progressHandler: (Double, Int64, Int64) -> Void
+    private let completionHandler: (URL?, URLResponse?, Error?) -> Void
+    private var downloadedURL: URL?
+
+    init(
+        progressHandler: @escaping (Double, Int64, Int64) -> Void,
+        completionHandler: @escaping (URL?, URLResponse?, Error?) -> Void
+    ) {
+        self.progressHandler = progressHandler
+        self.completionHandler = completionHandler
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        if totalBytesExpectedToWrite > 0 {
+            let fraction = min(max(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite), 0), 1)
+            progressHandler(fraction, totalBytesWritten, totalBytesExpectedToWrite)
+        } else {
+            progressHandler(-1, totalBytesWritten, totalBytesExpectedToWrite)
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        downloadedURL = location
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        completionHandler(downloadedURL, task.response, error)
+    }
+}
+
+private final class LAZDecodeProgressBox {
+    let onProgress: (Double) -> Void
+    let isCancelled: () -> Bool
+
+    init(onProgress: @escaping (Double) -> Void, isCancelled: @escaping () -> Bool) {
+        self.onProgress = onProgress
+        self.isCancelled = isCancelled
+    }
+}
+
+private let lazDecodeProgressThunk: @convention(c) (Float, UnsafeMutableRawPointer?) -> Void = { fraction, context in
+    guard let context else { return }
+    let box = Unmanaged<LAZDecodeProgressBox>.fromOpaque(context).takeUnretainedValue()
+    let clamped = min(max(Double(fraction), 0), 1)
+    box.onProgress(clamped)
+}
+
+private let lazDecodeCancelThunk: @convention(c) (UnsafeMutableRawPointer?) -> Bool = { context in
+    guard let context else { return false }
+    let box = Unmanaged<LAZDecodeProgressBox>.fromOpaque(context).takeUnretainedValue()
+    return box.isCancelled()
+}
+
 class PointCloudEngine: ObservableObject {
     enum PLYExportFormat {
         case binaryLittleEndian
@@ -39,6 +99,39 @@ class PointCloudEngine: ObservableObject {
             return items
         }
     }
+
+    private enum COPCStreamAttempt {
+        case fallbackToFull
+        case success
+        case failure(String)
+    }
+
+    private struct COPCHeaderInfo {
+        var pointFormat: UInt8
+        var pointRecordLength: UInt16
+        var scaleX: Double
+        var scaleY: Double
+        var scaleZ: Double
+        var offsetX: Double
+        var offsetY: Double
+        var offsetZ: Double
+        var centerX: Double
+        var centerY: Double
+        var centerZ: Double
+        var rootHierarchyOffset: UInt64
+        var rootHierarchySize: UInt64
+        var pointCount: UInt64
+    }
+
+    private struct COPCHierarchyEntry {
+        var level: Int32
+        var x: Int32
+        var y: Int32
+        var z: Int32
+        var offset: UInt64
+        var byteSize: Int32
+        var pointCount: Int32
+    }
     
     // MARK: - Constants
     let maxVoxels: Int = 2_000_000 // 2 million points for higher detail
@@ -65,6 +158,7 @@ class PointCloudEngine: ObservableObject {
     
     // Texture Caches
     private var cvTextureCache: CVMetalTextureCache?
+    private let copcNodeSnapshotCache = NSCache<NSString, NSData>()
     private let inFlightSemaphore = DispatchSemaphore(value: 1)
     private let generationLock = NSLock()
     private var generationToken: UInt64 = 0
@@ -80,6 +174,9 @@ class PointCloudEngine: ObservableObject {
         
         setupMetal()
         setupBuffers()
+
+        copcNodeSnapshotCache.totalCostLimit = 96 * 1_024 * 1_024
+        copcNodeSnapshotCache.countLimit = 512
         
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cvTextureCache)
     }
@@ -388,6 +485,883 @@ class PointCloudEngine: ObservableObject {
         currentPointCount = loaded
         DispatchQueue.main.async {
             self.activePointCount = loaded
+        }
+    }
+
+    @discardableResult
+    private func mergeCompactSnapshot(_ data: Data) -> Int {
+        let voxelStride = MemoryLayout<Voxel>.stride
+        let headerSize = MemoryLayout<UInt32>.size * 3
+        let recordSize = MemoryLayout<UInt32>.size + voxelStride
+
+        guard data.count >= headerSize else { return 0 }
+
+        func readUInt32(at offset: Int) -> UInt32? {
+            guard offset + MemoryLayout<UInt32>.size <= data.count else { return nil }
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + MemoryLayout<UInt32>.size))
+            }
+            return value
+        }
+
+        func readVoxel(at offset: Int) -> Voxel? {
+            guard offset + voxelStride <= data.count else { return nil }
+            var voxel = Voxel(positionAndConfidence: .zero, colorAndSampleCount: .zero)
+            _ = withUnsafeMutableBytes(of: &voxel) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + voxelStride))
+            }
+            return voxel
+        }
+
+        guard let magic = readUInt32(at: 0), magic == 0x50435331 else { return 0 }
+        guard let version = readUInt32(at: MemoryLayout<UInt32>.size), version == 1 else { return 0 }
+        guard let storedCount = readUInt32(at: MemoryLayout<UInt32>.size * 2) else { return 0 }
+
+        let maxRecordsBySize = max(0, (data.count - headerSize) / recordSize)
+        let count = min(Int(storedCount), maxRecordsBySize)
+        let voxels = voxelBuffer.contents().assumingMemoryBound(to: Voxel.self)
+
+        var offset = headerSize
+        var newlyInserted = 0
+        for _ in 0..<count {
+            guard offset + recordSize <= data.count else { break }
+            guard let rawIndex = readUInt32(at: offset) else { break }
+            let index = Int(rawIndex)
+            offset += MemoryLayout<UInt32>.size
+
+            guard index >= 0 && index < maxVoxels else {
+                offset += voxelStride
+                continue
+            }
+            guard let incoming = readVoxel(at: offset) else { break }
+            offset += voxelStride
+            if incoming.colorAndSampleCount.w <= 0 { continue }
+
+            if voxels[index].colorAndSampleCount.w <= 0 {
+                newlyInserted += 1
+            }
+            voxels[index] = incoming
+        }
+
+        if newlyInserted > 0 {
+            currentPointCount = min(maxVoxels, currentPointCount + newlyInserted)
+            resetCounter(to: currentPointCount)
+            activePointCount = currentPointCount
+        }
+
+        return newlyInserted
+    }
+
+    private func parseCOPCHeaderInfo(from data: Data) -> COPCHeaderInfo? {
+        func readUInt8(_ offset: Int) -> UInt8? {
+            guard offset + 1 <= data.count else { return nil }
+            return data[offset]
+        }
+
+        func readUInt16LE(_ offset: Int) -> UInt16? {
+            guard offset + 2 <= data.count else { return nil }
+            var value: UInt16 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + 2))
+            }
+            return UInt16(littleEndian: value)
+        }
+
+        func readUInt32LE(_ offset: Int) -> UInt32? {
+            guard offset + 4 <= data.count else { return nil }
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + 4))
+            }
+            return UInt32(littleEndian: value)
+        }
+
+        func readUInt64LE(_ offset: Int) -> UInt64? {
+            guard offset + 8 <= data.count else { return nil }
+            var value: UInt64 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + 8))
+            }
+            return UInt64(littleEndian: value)
+        }
+
+        func readDoubleLE(_ offset: Int) -> Double? {
+            guard let bits = readUInt64LE(offset) else { return nil }
+            return Double(bitPattern: bits)
+        }
+
+        guard let headerSize = readUInt16LE(94),
+              let pointOffset = readUInt32LE(96),
+              let vlrCount = readUInt32LE(100),
+              let pointFormatRaw = readUInt8(104),
+              let pointRecordLength = readUInt16LE(105),
+              let scaleX = readDoubleLE(131),
+              let scaleY = readDoubleLE(139),
+              let scaleZ = readDoubleLE(147),
+              let offsetX = readDoubleLE(155),
+              let offsetY = readDoubleLE(163),
+              let offsetZ = readDoubleLE(171) else {
+            return nil
+        }
+
+        let needed = Int(pointOffset)
+        guard needed > 0, needed <= data.count else { return nil }
+
+        var copcCenterX: Double?
+        var copcCenterY: Double?
+        var copcCenterZ: Double?
+        var rootHierOffset: UInt64?
+        var rootHierSize: UInt64?
+
+        var cursor = Int(headerSize)
+        for _ in 0..<vlrCount {
+            guard cursor + 54 <= needed else { break }
+
+            guard let recordID = readUInt16LE(cursor + 18),
+                  let recordLength = readUInt16LE(cursor + 20) else {
+                break
+            }
+
+            let userIdStart = cursor + 2
+            let userIdEnd = userIdStart + 16
+            guard userIdEnd <= needed else { break }
+            let userIdData = data.subdata(in: userIdStart..<userIdEnd)
+            let userId = String(data: userIdData, encoding: .ascii)?
+                .trimmingCharacters(in: .controlCharacters.union(.whitespaces))
+                .replacingOccurrences(of: "\0", with: "") ?? ""
+
+            let payloadStart = cursor + 54
+            let payloadEnd = payloadStart + Int(recordLength)
+            guard payloadEnd <= needed else { break }
+
+            if userId == "copc", recordID == 1, recordLength >= 56 {
+                let payload = data.subdata(in: payloadStart..<payloadEnd)
+                func payloadU64(_ off: Int) -> UInt64 {
+                    var value: UInt64 = 0
+                    _ = withUnsafeMutableBytes(of: &value) { dst in
+                        payload.copyBytes(to: dst, from: off..<(off + 8))
+                    }
+                    return UInt64(littleEndian: value)
+                }
+                func payloadDouble(_ off: Int) -> Double {
+                    Double(bitPattern: payloadU64(off))
+                }
+                copcCenterX = payloadDouble(0)
+                copcCenterY = payloadDouble(8)
+                copcCenterZ = payloadDouble(16)
+                rootHierOffset = payloadU64(40)
+                rootHierSize = payloadU64(48)
+                break
+            }
+
+            cursor = payloadEnd
+        }
+
+        guard let centerX = copcCenterX,
+              let centerY = copcCenterY,
+              let centerZ = copcCenterZ,
+              let rootOffset = rootHierOffset,
+              let rootSize = rootHierSize,
+              rootSize > 0 else {
+            return nil
+        }
+
+        let pointCount = readUInt64LE(247) ?? UInt64(readUInt32LE(107) ?? 0)
+        return COPCHeaderInfo(
+            pointFormat: pointFormatRaw & 0x3f,
+            pointRecordLength: pointRecordLength,
+            scaleX: scaleX,
+            scaleY: scaleY,
+            scaleZ: scaleZ,
+            offsetX: offsetX,
+            offsetY: offsetY,
+            offsetZ: offsetZ,
+            centerX: centerX,
+            centerY: centerY,
+            centerZ: centerZ,
+            rootHierarchyOffset: rootOffset,
+            rootHierarchySize: rootSize,
+            pointCount: pointCount
+        )
+    }
+
+    private func parseCOPCHierarchyEntries(from data: Data) -> [COPCHierarchyEntry] {
+        guard data.count >= 32 else { return [] }
+
+        func readInt32LE(_ offset: Int) -> Int32 {
+            var value: Int32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + 4))
+            }
+            return Int32(littleEndian: value)
+        }
+
+        func readUInt64LE(_ offset: Int) -> UInt64 {
+            var value: UInt64 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                data.copyBytes(to: dst, from: offset..<(offset + 8))
+            }
+            return UInt64(littleEndian: value)
+        }
+
+        let entrySize = 32
+        let count = data.count / entrySize
+        var entries: [COPCHierarchyEntry] = []
+        entries.reserveCapacity(count)
+        for i in 0..<count {
+            let off = i * entrySize
+            entries.append(
+                COPCHierarchyEntry(
+                    level: readInt32LE(off),
+                    x: readInt32LE(off + 4),
+                    y: readInt32LE(off + 8),
+                    z: readInt32LE(off + 12),
+                    offset: readUInt64LE(off + 16),
+                    byteSize: readInt32LE(off + 24),
+                    pointCount: readInt32LE(off + 28)
+                )
+            )
+        }
+        return entries
+    }
+
+    private func copcNodeCacheKey(for remoteURL: URL, entry: COPCHierarchyEntry) -> NSString {
+        "\(remoteURL.absoluteString)|\(entry.level)|\(entry.x)|\(entry.y)|\(entry.z)|\(entry.offset)|\(entry.byteSize)|\(entry.pointCount)" as NSString
+    }
+
+    private func recommendedCOPCStreamPointBudget() -> Int {
+        let ramBytes = ProcessInfo.processInfo.physicalMemory
+        let budget: Int
+        if ramBytes >= 7_500_000_000 {
+            budget = 1_200_000
+        } else if ramBytes >= 5_500_000_000 {
+            budget = 900_000
+        } else {
+            budget = 650_000
+        }
+        return min(maxVoxels, budget)
+    }
+
+    private func selectCOPCEntries(
+        from entries: [COPCHierarchyEntry],
+        targetPointBudget: Int,
+        maxNodes: Int,
+        excludingOffsets: Set<UInt64> = []
+    ) -> [COPCHierarchyEntry] {
+        guard targetPointBudget > 0, maxNodes > 0 else { return [] }
+
+        var selected: [COPCHierarchyEntry] = []
+        selected.reserveCapacity(min(maxNodes, entries.count))
+        var accumulated = 0
+        var seenOffsets = excludingOffsets
+
+        for entry in entries {
+            if seenOffsets.contains(entry.offset) {
+                continue
+            }
+            selected.append(entry)
+            seenOffsets.insert(entry.offset)
+            accumulated += max(0, Int(entry.pointCount))
+            if selected.count >= maxNodes || accumulated >= targetPointBudget {
+                break
+            }
+        }
+        return selected
+    }
+
+    private func tryImportCOPCStreaming(
+        _ remoteURL: URL,
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil
+    ) -> COPCStreamAttempt {
+        func finishCancelled() -> COPCStreamAttempt {
+            .failure("Import cancelled.")
+        }
+
+        if isCancelled?() == true {
+            return finishCancelled()
+        }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 25
+        config.timeoutIntervalForResource = 120
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        func rangeError(_ message: String, code: Int = 1) -> NSError {
+            NSError(
+                domain: "PointCloudEngine.COPC",
+                code: code,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        func fetchRange(start: UInt64, length: UInt64) -> Result<Data, Error> {
+            guard length > 0 else { return .failure(rangeError("Invalid range length.")) }
+            let end = start + length - 1
+            var req = URLRequest(url: remoteURL)
+            req.timeoutInterval = 30
+            req.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
+
+            let sem = DispatchSemaphore(value: 0)
+            var responseData: Data?
+            var response: URLResponse?
+            var responseError: Error?
+            let task = session.dataTask(with: req) { data, resp, err in
+                responseData = data
+                response = resp
+                responseError = err
+                sem.signal()
+            }
+            task.resume()
+
+            while true {
+                if sem.wait(timeout: .now() + 0.1) == .success {
+                    break
+                }
+                if isCancelled?() == true {
+                    task.cancel()
+                    return .failure(rangeError("Import cancelled."))
+                }
+            }
+
+            if let responseError {
+                let ns = responseError as NSError
+                if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled {
+                    return .failure(rangeError("Import cancelled."))
+                }
+                return .failure(responseError)
+            }
+
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(rangeError("Invalid server response."))
+            }
+
+            guard let payload = responseData else {
+                return .failure(rangeError("No response data."))
+            }
+
+            if http.statusCode == 206 {
+                return .success(payload)
+            }
+            if http.statusCode == 200, start == 0 {
+                return .success(payload)
+            }
+            return .failure(rangeError("Server does not support range requests for COPC streaming."))
+        }
+
+        func fetchRangeWithRetry(
+            start: UInt64,
+            length: UInt64,
+            attempts: Int = 3
+        ) -> Result<Data, Error> {
+            let maxAttempts = max(1, attempts)
+            var attempt = 0
+            var lastError: Error = rangeError("Unknown range request error.")
+
+            while attempt < maxAttempts {
+                if isCancelled?() == true {
+                    return .failure(rangeError("Import cancelled.", code: NSURLErrorCancelled))
+                }
+
+                switch fetchRange(start: start, length: length) {
+                case .success(let data):
+                    return .success(data)
+                case .failure(let error):
+                    lastError = error
+                    let nsError = error as NSError
+                    if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                        return .failure(error)
+                    }
+                }
+
+                attempt += 1
+                if attempt < maxAttempts {
+                    Thread.sleep(forTimeInterval: 0.20 * Double(attempt))
+                }
+            }
+
+            return .failure(lastError)
+        }
+
+        func decodeCOPCNodeChunk(_ chunkData: Data, entry: COPCHierarchyEntry, headerInfo: COPCHeaderInfo) -> Result<Data, Error> {
+            var snapshotPointer: UnsafeMutablePointer<UInt8>?
+            var snapshotSize: UInt32 = 0
+            var snapshotPointCount: UInt32 = 0
+            var errorBuffer = [CChar](repeating: 0, count: 512)
+
+            let decodeOK = chunkData.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                return pp_laz_decompress_chunk_to_snapshot(
+                    base,
+                    UInt32(chunkData.count),
+                    headerInfo.pointFormat,
+                    headerInfo.pointRecordLength,
+                    UInt32(entry.pointCount),
+                    headerInfo.scaleX,
+                    headerInfo.scaleY,
+                    headerInfo.scaleZ,
+                    headerInfo.offsetX,
+                    headerInfo.offsetY,
+                    headerInfo.offsetZ,
+                    Float(headerInfo.centerX),
+                    Float(headerInfo.centerY),
+                    Float(headerInfo.centerZ),
+                    self.voxelSize,
+                    UInt32(self.maxVoxels),
+                    &snapshotPointer,
+                    &snapshotSize,
+                    &snapshotPointCount,
+                    &errorBuffer,
+                    UInt32(errorBuffer.count)
+                )
+            }
+
+            guard decodeOK, let snapshotPointer, snapshotSize > 0, snapshotPointCount > 0 else {
+                let message = String(cString: errorBuffer)
+                return .failure(rangeError(message.isEmpty ? "Failed to decode streamed COPC node." : message))
+            }
+
+            let snapshotData = Data(bytes: snapshotPointer, count: Int(snapshotSize))
+            pp_free_buffer(snapshotPointer)
+            return .success(snapshotData)
+        }
+
+        progress?(0.05, "Checking COPC header...")
+        let firstHeaderData: Data
+        switch fetchRangeWithRetry(start: 0, length: 4096, attempts: 2) {
+        case .success(let data):
+            firstHeaderData = data
+        case .failure:
+            return .fallbackToFull
+        }
+
+        guard firstHeaderData.count >= 100 else {
+            return .fallbackToFull
+        }
+        let pointOffset: UInt32 = {
+            var value: UInt32 = 0
+            _ = withUnsafeMutableBytes(of: &value) { dst in
+                firstHeaderData.copyBytes(to: dst, from: 96..<100)
+            }
+            return UInt32(littleEndian: value)
+        }()
+        if pointOffset == 0 {
+            return .fallbackToFull
+        }
+
+        if pointOffset > 8_000_000 {
+            return .fallbackToFull
+        }
+
+        let fullHeaderData: Data
+        switch fetchRangeWithRetry(start: 0, length: UInt64(pointOffset), attempts: 2) {
+        case .success(let data):
+            fullHeaderData = data
+        case .failure:
+            return .fallbackToFull
+        }
+
+        guard let headerInfo = parseCOPCHeaderInfo(from: fullHeaderData) else {
+            return .fallbackToFull
+        }
+
+        if isCancelled?() == true {
+            return finishCancelled()
+        }
+
+        progress?(0.10, "Loading COPC hierarchy...")
+        var dataEntries: [COPCHierarchyEntry] = []
+        var hierarchyQueue: [(offset: UInt64, size: UInt64)] = [(headerInfo.rootHierarchyOffset, headerInfo.rootHierarchySize)]
+        var hierarchySeenOffsets = Set<UInt64>()
+        var queueIndex = 0
+        var hierarchyPagesRead = 0
+        let maxHierarchyPages = 384
+
+        while queueIndex < hierarchyQueue.count && hierarchyPagesRead < maxHierarchyPages {
+            if isCancelled?() == true {
+                return finishCancelled()
+            }
+
+            let page = hierarchyQueue[queueIndex]
+            queueIndex += 1
+            guard page.size > 0, !hierarchySeenOffsets.contains(page.offset) else { continue }
+            hierarchySeenOffsets.insert(page.offset)
+
+            let pageData: Data
+            switch fetchRangeWithRetry(start: page.offset, length: page.size, attempts: 3) {
+            case .success(let data):
+                pageData = data
+            case .failure(let error):
+                if hierarchyPagesRead == 0 {
+                    return .failure(error.localizedDescription)
+                }
+                continue
+            }
+
+            hierarchyPagesRead += 1
+            let entries = parseCOPCHierarchyEntries(from: pageData)
+            for entry in entries {
+                if entry.pointCount > 0, entry.byteSize > 0, entry.offset > 0 {
+                    dataEntries.append(entry)
+                } else if entry.pointCount == -1, entry.byteSize > 0, entry.offset > 0 {
+                    hierarchyQueue.append((entry.offset, UInt64(entry.byteSize)))
+                }
+            }
+
+            if hierarchyPagesRead == 1 || hierarchyPagesRead % 8 == 0 {
+                let phase = min(1.0, Double(hierarchyPagesRead) / 32.0)
+                progress?(0.10 + (0.08 * phase), "Loading COPC hierarchy... \(hierarchyPagesRead) page(s)")
+            }
+        }
+
+        if hierarchyPagesRead >= maxHierarchyPages {
+            progress?(0.18, "Hierarchy limit reached, streaming best available detail...")
+        }
+
+        if dataEntries.isEmpty {
+            return .failure("No streamable nodes found in COPC hierarchy.")
+        }
+
+        var uniqueEntriesByOffset: [UInt64: COPCHierarchyEntry] = [:]
+        uniqueEntriesByOffset.reserveCapacity(dataEntries.count)
+        for entry in dataEntries {
+            if let existing = uniqueEntriesByOffset[entry.offset] {
+                if entry.level < existing.level || (entry.level == existing.level && entry.pointCount > existing.pointCount) {
+                    uniqueEntriesByOffset[entry.offset] = entry
+                }
+            } else {
+                uniqueEntriesByOffset[entry.offset] = entry
+            }
+        }
+        dataEntries = Array(uniqueEntriesByOffset.values)
+
+        dataEntries.sort { a, b in
+            if a.level != b.level {
+                return a.level < b.level
+            }
+            return a.pointCount > b.pointCount
+        }
+
+        let targetPointBudget = recommendedCOPCStreamPointBudget()
+        let previewBudget = min(max(90_000, targetPointBudget / 5), 260_000)
+        let previewEntries = selectCOPCEntries(
+            from: dataEntries,
+            targetPointBudget: previewBudget,
+            maxNodes: 12
+        )
+        let previewOffsets = Set(previewEntries.map(\.offset))
+        let previewPointEstimate = previewEntries.reduce(0) { partial, entry in
+            partial + max(0, Int(entry.pointCount))
+        }
+        let refinementBudget = max(0, targetPointBudget - previewPointEstimate)
+        let refinementEntries = selectCOPCEntries(
+            from: dataEntries,
+            targetPointBudget: refinementBudget,
+            maxNodes: 160,
+            excludingOffsets: previewOffsets
+        )
+        let selectedEntries = previewEntries + refinementEntries
+
+        if selectedEntries.isEmpty {
+            return .failure("No preview nodes selected for COPC stream.")
+        }
+
+        DispatchQueue.main.sync {
+            self.clearBuffer()
+        }
+
+        progress?(0.20, "Streaming preview...")
+
+        var loadedPreviewNodes = 0
+        var loadedRefinementNodes = 0
+        var loadedAny = false
+        var mergedPointCount = 0
+        let totalPreviewNodes = max(1, previewEntries.count)
+        let totalRefinementNodes = max(1, refinementEntries.count)
+        let totalSelectedNodes = max(1, selectedEntries.count)
+
+        for (idx, entry) in selectedEntries.enumerated() {
+            if isCancelled?() == true {
+                return finishCancelled()
+            }
+
+            let isPreviewNode = idx < previewEntries.count
+            if isPreviewNode {
+                let previewProgress = 0.20 + (Double(idx) / Double(totalPreviewNodes)) * 0.22
+                progress?(previewProgress, "Streaming preview node \(idx + 1)/\(previewEntries.count)...")
+            } else {
+                let refineIdx = idx - previewEntries.count
+                let refineProgress = 0.44 + (Double(refineIdx) / Double(totalRefinementNodes)) * 0.54
+                progress?(refineProgress, "Refining detail \(refineIdx + 1)/\(refinementEntries.count)...")
+            }
+
+            let chunkLength = UInt64(max(0, entry.byteSize))
+            guard chunkLength > 0 else { continue }
+
+            let nodeCacheKey = copcNodeCacheKey(for: remoteURL, entry: entry)
+            let snapshotData: Data
+            if let cachedSnapshot = copcNodeSnapshotCache.object(forKey: nodeCacheKey) {
+                snapshotData = Data(referencing: cachedSnapshot)
+            } else {
+                let chunkData: Data
+                switch fetchRangeWithRetry(start: entry.offset, length: chunkLength, attempts: 3) {
+                case .success(let data):
+                    chunkData = data
+                case .failure(let error):
+                    if loadedAny {
+                        continue
+                    }
+                    return .failure(error.localizedDescription)
+                }
+
+                switch decodeCOPCNodeChunk(chunkData, entry: entry, headerInfo: headerInfo) {
+                case .success(let decodedSnapshot):
+                    snapshotData = decodedSnapshot
+                    copcNodeSnapshotCache.setObject(decodedSnapshot as NSData, forKey: nodeCacheKey, cost: decodedSnapshot.count)
+                case .failure(let error):
+                    if loadedAny {
+                        continue
+                    }
+                    return .failure(error.localizedDescription)
+                }
+            }
+
+            DispatchQueue.main.sync {
+                let inserted = self.mergeCompactSnapshot(snapshotData)
+                if inserted > 0 {
+                    loadedAny = true
+                    mergedPointCount += inserted
+                }
+            }
+
+            if isPreviewNode {
+                loadedPreviewNodes += 1
+                if loadedPreviewNodes == 1 {
+                    progress?(0.42, "Preview ready, refining detail...")
+                }
+            } else {
+                loadedRefinementNodes += 1
+                if loadedRefinementNodes % 6 == 0 || idx == selectedEntries.count - 1 {
+                    let countString = NumberFormatter.localizedString(
+                        from: NSNumber(value: max(0, mergedPointCount)),
+                        number: .decimal
+                    )
+                    progress?(
+                        0.44 + (Double(loadedRefinementNodes) / Double(totalRefinementNodes)) * 0.54,
+                        "Refining detail \(loadedRefinementNodes)/\(refinementEntries.count) • \(countString) pts"
+                    )
+                }
+            }
+        }
+
+        if !loadedAny {
+            return .failure("Could not stream any COPC nodes.")
+        }
+
+        DispatchQueue.main.async {
+            self.activePointCount = self.currentPointCount
+        }
+
+        let loadedCountString = NumberFormatter.localizedString(from: NSNumber(value: currentPointCount), number: .decimal)
+        progress?(
+            1.0,
+            "High detail ready • \(loadedCountString) pts (\(loadedPreviewNodes + loadedRefinementNodes)/\(totalSelectedNodes) nodes)"
+        )
+        return .success
+    }
+
+    func importPointCloudFromURL(
+        _ remoteURL: URL,
+        progress: ((Double, String) -> Void)? = nil,
+        isCancelled: (() -> Bool)? = nil,
+        completion: @escaping (Bool, String?) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            func finish(_ success: Bool, _ message: String?) {
+                DispatchQueue.main.async {
+                    completion(success, message)
+                }
+            }
+
+            if isCancelled?() == true {
+                finish(false, "Import cancelled.")
+                return
+            }
+
+            switch self.tryImportCOPCStreaming(remoteURL, progress: progress, isCancelled: isCancelled) {
+            case .success:
+                finish(true, nil)
+                return
+            case .failure(let message):
+                finish(false, message)
+                return
+            case .fallbackToFull:
+                break
+            }
+
+            progress?(0.05, "Checking remote file...")
+
+            var headRequest = URLRequest(url: remoteURL)
+            headRequest.httpMethod = "HEAD"
+            headRequest.timeoutInterval = 20
+
+            let headSemaphore = DispatchSemaphore(value: 0)
+            var headResponse: HTTPURLResponse?
+            var headError: Error?
+            let headSession = URLSession(configuration: .ephemeral)
+            defer { headSession.invalidateAndCancel() }
+            let headTask = headSession.dataTask(with: headRequest) { _, response, error in
+                headResponse = response as? HTTPURLResponse
+                headError = error
+                headSemaphore.signal()
+            }
+            headTask.resume()
+            headSemaphore.wait()
+
+            // Some servers reject HEAD while allowing GET/range requests.
+            // Continue to download unless HEAD clearly reports unsupported access.
+            if let headResponse, [401, 403].contains(headResponse.statusCode) {
+                finish(false, "Server denied access (HTTP \(headResponse.statusCode)).")
+                return
+            }
+            if headError != nil {
+                progress?(0.10, "HEAD unavailable; trying direct download...")
+            }
+
+            if isCancelled?() == true {
+                finish(false, "Import cancelled.")
+                return
+            }
+
+            progress?(0.20, "Downloading COPC/LAZ file...")
+            let downloadSemaphore = DispatchSemaphore(value: 0)
+            var downloadedURL: URL?
+            var downloadResponse: HTTPURLResponse?
+            var downloadError: Error?
+            var lastDownloadPercent = -1
+            let downloadDelegate = URLImportDownloadDelegate(
+                progressHandler: { fraction, totalBytesWritten, _ in
+                    if fraction >= 0 {
+                        let percent = Int((fraction * 100).rounded())
+                        guard percent != lastDownloadPercent else { return }
+                        lastDownloadPercent = percent
+                        let mapped = 0.20 + (fraction * 0.50)
+                        progress?(mapped, "Downloading COPC/LAZ file... \(percent)%")
+                    } else {
+                        let writtenMB = Double(totalBytesWritten) / 1_048_576.0
+                        progress?(0.24, String(format: "Downloading COPC/LAZ file... %.1f MB", writtenMB))
+                    }
+                },
+                completionHandler: { localURL, response, error in
+                    downloadedURL = localURL
+                    downloadResponse = response as? HTTPURLResponse
+                    downloadError = error
+                    downloadSemaphore.signal()
+                }
+            )
+            let downloadSession = URLSession(configuration: .ephemeral, delegate: downloadDelegate, delegateQueue: nil)
+            let downloadTask = downloadSession.downloadTask(with: remoteURL)
+            downloadTask.resume()
+
+            while true {
+                if downloadSemaphore.wait(timeout: .now() + 0.15) == .success {
+                    break
+                }
+                if isCancelled?() == true {
+                    downloadTask.cancel()
+                    downloadSession.invalidateAndCancel()
+                    finish(false, "Import cancelled.")
+                    return
+                }
+            }
+            downloadSession.finishTasksAndInvalidate()
+
+            if let downloadError {
+                let nsError = downloadError as NSError
+                if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+                    finish(false, "Import cancelled.")
+                    return
+                }
+                finish(false, "Download failed: \(downloadError.localizedDescription)")
+                return
+            }
+            guard let downloadResponse, (200...299).contains(downloadResponse.statusCode) else {
+                finish(false, "Download failed due to server response.")
+                return
+            }
+            guard let localURL = downloadedURL else {
+                finish(false, "Download failed: no file received.")
+                return
+            }
+
+            if isCancelled?() == true {
+                try? FileManager.default.removeItem(at: localURL)
+                finish(false, "Import cancelled.")
+                return
+            }
+
+            progress?(0.70, "Decoding point cloud...")
+            var snapshotPointer: UnsafeMutablePointer<UInt8>?
+            var snapshotSize: UInt32 = 0
+            var pointCount: UInt32 = 0
+            var errorBuffer = [CChar](repeating: 0, count: 512)
+            let decodeCallbacks = LAZDecodeProgressBox(
+                onProgress: { fraction in
+                    let mapped = 0.70 + (fraction * 0.20)
+                    progress?(mapped, "Decoding point cloud... \(Int((fraction * 100).rounded()))%")
+                },
+                isCancelled: {
+                    isCancelled?() == true
+                }
+            )
+            let decodeCallbackContext = Unmanaged.passRetained(decodeCallbacks).toOpaque()
+            defer {
+                Unmanaged<LAZDecodeProgressBox>.fromOpaque(decodeCallbackContext).release()
+            }
+
+            let decodeOK = localURL.path.withCString { pathCString in
+                pp_laz_create_snapshot(
+                    pathCString,
+                    UInt32(self.maxVoxels),
+                    lazDecodeProgressThunk,
+                    lazDecodeCancelThunk,
+                    decodeCallbackContext,
+                    &snapshotPointer,
+                    &snapshotSize,
+                    &pointCount,
+                    &errorBuffer,
+                    UInt32(errorBuffer.count)
+                )
+            }
+            try? FileManager.default.removeItem(at: localURL)
+
+            guard decodeOK, let snapshotPointer, snapshotSize > 0, pointCount > 0 else {
+                let message = String(cString: errorBuffer)
+                if isCancelled?() == true || message.localizedCaseInsensitiveContains("cancel") {
+                    finish(false, "Import cancelled.")
+                } else {
+                    finish(false, message.isEmpty ? "Unsupported or invalid LAZ/COPC file." : message)
+                }
+                return
+            }
+
+            let snapshotData = Data(bytes: snapshotPointer, count: Int(snapshotSize))
+            pp_free_buffer(snapshotPointer)
+
+            if isCancelled?() == true {
+                finish(false, "Import cancelled.")
+                return
+            }
+
+            progress?(0.90, "Loading point cloud...")
+            DispatchQueue.main.async {
+                self.clearBuffer()
+                self.loadSnapshot(snapshotData, pointCount: Int(pointCount))
+                progress?(1.0, "Loaded successfully.")
+                completion(true, nil)
+            }
         }
     }
 

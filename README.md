@@ -1,36 +1,38 @@
 # PointPro
 
-PointPro is an iOS LiDAR app for on-device point cloud capture, review, measurement, and deliverable export.
+PointPro is an iOS LiDAR app for on-device point cloud capture, remote COPC loading, measurement, and deliverable export.
 
 ## Current Capabilities
 
-- Real-time point cloud capture with session management
-- Interactive 3D viewer (pan, orbit, zoom, roll, recenter)
+- Real-time LiDAR capture pipeline with scan session management
+- Remote point cloud import via HTTPS URL (`.copc.laz` / `.laz`) with progressive refinement
+- Interactive 3D viewer (pan, orbit, zoom, recenter, roll lock/unlock)
+- Color modes: `Auto`, `RGB`, `Elevation (Viridis)`, `Intensity`, `Classification`
 - Measurement workflows:
-  - Vertex snapping with polyline/polygon tools
+  - Vertex snapping with path and closed-area tools
   - Distance, perimeter, and area
   - Cross-section and elevation profile analysis
 - Export workflows:
-  - LAZ (georeferenced using device GPS, with metadata sidecar)
-  - PLY (Binary, Fast) and PLY (Text, ASCII)
-  - PDF survey report with visual evidence and measurement analytics
-- Export UX with progress, cancellation, and native share
+  - `LAZ` (device-GPS georeferenced) + metadata sidecar (`.json`)
+  - `PLY (Binary, Fast)` and `PLY (Text, ASCII)`
+  - Enterprise-style PDF report (stats, georef context, measurement register, visual evidence)
+- Import/export UX with progress, cancellation, and native share
 
 <table>
 <tr>
-  <td><img src="./assets/screenshots/a.PNG" alt="a" width="240"/></td>
-  <td><img src="./assets/screenshots/b.PNG" alt="b" width="240"/></td>
-  <td><img src="./assets/screenshots/c.png" alt="c" width="240"/></td>
+  <td><img src="./assets/screenshots/a1.PNG" alt="1" width="240"/></td>
+  <td><img src="./assets/screenshots/a2.PNG" alt="2" width="240"/></td>
+  <td><img src="./assets/screenshots/a3.PNG" alt="3" width="240"/></td>
 </tr>
 <tr>
-  <td><img src="./assets/screenshots/1.PNG" alt="1" width="240"/></td>
-  <td><img src="./assets/screenshots/2.PNG" alt="2" width="240"/></td>
-  <td><img src="./assets/screenshots/3.PNG" alt="3" width="240"/></td>
+  <td><img src="./assets/screenshots/a4.PNG" alt="4" width="240"/></td>
+  <td><img src="./assets/screenshots/a5.PNG" alt="5" width="240"/></td>
+  <td><img src="./assets/screenshots/a6.PNG" alt="6" width="240"/></td>
 </tr>
 <tr>
-  <td><img src="./assets/screenshots/4.PNG" alt="4" width="240"/></td>
-  <td><img src="./assets/screenshots/5.PNG" alt="5" width="240"/></td>
-  <td><img src="./assets/screenshots/6.PNG" alt="6" width="240"/></td>
+  <td><img src="./assets/screenshots/a7.PNG" alt="7" width="240"/></td>
+  <td><img src="./assets/screenshots/a8.PNG" alt="8" width="240"/></td>
+  <td><img src="./assets/screenshots/a9.PNG" alt="9" width="240"/></td>
 </tr>
 </table>
 
@@ -60,7 +62,7 @@ assets/             # Screenshots and brand assets
 
 ## Status
 
-Active development. Core capture, measurement, and export pipelines are functional.
+Active development. Core capture, COPC import, measurement, and export/report pipelines are functional.
 
 ## License
 

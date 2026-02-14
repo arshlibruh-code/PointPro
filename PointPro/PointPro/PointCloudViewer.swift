@@ -12,6 +12,29 @@ import UIKit
 import QuartzCore
 import Combine
 
+enum CloudColorMode: Int, CaseIterable {
+    case auto = 0
+    case rgb = 1
+    case elevation = 2
+    case intensity = 3
+    case classification = 4
+
+    var title: String {
+        switch self {
+        case .auto: return "AUTO"
+        case .rgb: return "RGB"
+        case .elevation: return "ELEVATION"
+        case .intensity: return "INTENSITY"
+        case .classification: return "CLASSIFICATION"
+        }
+    }
+}
+
+struct PointCloudRenderColorStatus: Equatable {
+    var hasUsableRGB: Bool
+    var effectiveMode: CloudColorMode
+}
+
 struct PointCloudViewer: View {
     let engine: PointCloudEngine
     let device: MTLDevice
@@ -29,10 +52,33 @@ struct PointCloudViewer: View {
     @State private var exportCancellation = ExportCancellationFlag()
     @State private var showExportCancelledNotice = false
     @State private var showExportFormatPicker = false
+    @State private var showColorModePicker = false
+    @State private var showImportURLSheet = false
+    @State private var importURLText = "https://s3.amazonaws.com/hobu-lidar/autzen-classified.copc.laz"
+    @State private var isImporting = false
+    @State private var importStatusText = "Preparing import..."
+    @State private var importProgress: Double = 0.0
+    @State private var importErrorText = "Could not import this URL."
+    @State private var showImportError = false
+    @State private var importCancellation = ExportCancellationFlag()
+    @State private var importedSourceLabel: String?
+    @State private var importedSourceURLText: String?
+    @State private var showImportCancelledNotice = false
     @State private var showGeorefPopover = false
     @State private var recenterSignal = 0
+    @State private var isRollUnlocked = false
+    @State private var uprightResetSignal = 0
+    @State private var selectedColorMode: CloudColorMode = .auto
+    @State private var effectiveColorMode: CloudColorMode = .auto
+    @State private var hasUsableRGB = true
     @StateObject private var measureController = MeasureController()
     private let buttonHaptic = UIImpactFeedbackGenerator(style: .rigid)
+    private let importSampleURLs: [(title: String, url: String)] = [
+        ("Autzen Stadium (Sample)", "https://s3.amazonaws.com/hobu-lidar/autzen-classified.copc.laz"),
+        ("Madison", "https://data.opengeos.org/madison.copc.laz"),
+        ("USGS TX Coastal", "https://data.opengeos.org/USGS_LPC_TX_CoastalRegion_2018_A18_stratmap18-50cm-2995201a1.copc.laz"),
+        ("Chicago", "https://data.opengeos.org/chicago.copc.laz")
+    ]
     
     var body: some View {
         ZStack {
@@ -43,9 +89,16 @@ struct PointCloudViewer: View {
             PointCloudViewerMetal(
                 device: device,
                 engine: engine,
-                isRenderingPaused: showExportFormatPicker,
+                isRenderingPaused: showExportFormatPicker || showImportURLSheet,
                 recenterSignal: recenterSignal,
-                measureController: measureController
+                isRollUnlocked: isRollUnlocked,
+                uprightResetSignal: uprightResetSignal,
+                measureController: measureController,
+                selectedColorMode: selectedColorMode,
+                onRenderColorStatusChanged: { status in
+                    hasUsableRGB = status.hasUsableRGB
+                    effectiveColorMode = status.effectiveMode
+                }
             )
                 .ignoresSafeArea()
 
@@ -145,35 +198,73 @@ struct PointCloudViewer: View {
 
                     Spacer()
 
-                    Button(action: {
-                        emitTapHaptic()
-                        recenterSignal &+= 1
-                    }) {
-                        Image(systemName: "scope")
-                            .font(.system(size: 14, weight: .semibold))
-                            .frame(width: 30, height: 30)
+                    HStack(spacing: 4) {
+                        Button(action: {
+                            emitTapHaptic()
+                            recenterSignal &+= 1
+                        }) {
+                            Image(systemName: "scope")
+                                .font(.system(size: 14, weight: .semibold))
+                                .frame(width: 30, height: 30)
+                        }
+                        .buttonStyle(.glass)
+
+                        if isRollUnlocked {
+                            Button(action: {
+                                emitTapHaptic()
+                                uprightResetSignal &+= 1
+                            }) {
+                                Image(systemName: "arrow.up.circle")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 30, height: 30)
+                            }
+                            .buttonStyle(.glass)
+                            .accessibilityLabel("Reset Upright")
+                        }
+
+                        Button(action: {
+                            emitTapHaptic()
+                            if isRollUnlocked {
+                                uprightResetSignal &+= 1
+                                isRollUnlocked = false
+                            } else {
+                                isRollUnlocked = true
+                            }
+                        }) {
+                            Image(systemName: isRollUnlocked ? "rotate.3d" : "level")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 30, height: 30)
+                        }
+                        .buttonStyle(.glass)
+                        .tint(isRollUnlocked ? .blue : .gray)
+                        .accessibilityLabel(isRollUnlocked ? "Free Roll Enabled (Tap to Level Lock)" : "Level Lock Enabled")
                     }
-                    .buttonStyle(.glass)
                     .padding()
                 }
                 
                 Spacer()
 
-                if let session {
+                if shouldShowInfoPanel {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(session.name)
+                        Text(panelTitle)
                             .font(.system(.title3, design: .monospaced).weight(.bold))
                             .foregroundStyle(.primary)
 
-                        Text("UPDATED \(formatDate(session.updatedAt))")
+                        Text(panelSubtitle)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
 
                         HStack(spacing: 8) {
-                            infoGlass("\(formatNumber(session.pointCount)) POINTS", tint: .blue)
-                            infoGlass(formatStorage(session.dataSizeBytes))
-                            infoGlass(session.status.rawValue.uppercased())
-                            georefStatusPill
+                            infoGlass("\(formatNumber(panelPointCount)) POINTS", tint: .blue)
+                            if let session {
+                                infoGlass(formatStorage(session.dataSizeBytes))
+                                infoGlass(session.status.rawValue.uppercased())
+                                georefStatusPill
+                            }
+                        }
+
+                        if session == nil {
+                            colorModeMenu
                         }
 
                         if measureController.isEnabled, let analysisCard = measureController.currentAnalysisCard {
@@ -281,7 +372,7 @@ struct PointCloudViewer: View {
                                     ))
                                 } else {
                                     HStack(spacing: 8) {
-                                        if let onContinue {
+                                        if session != nil, let onContinue {
                                             Button(action: {
                                                 emitTapHaptic()
                                                 onContinue()
@@ -292,13 +383,29 @@ struct PointCloudViewer: View {
                                             }
                                             .tint(.gray)
                                             .buttonStyle(.glass)
-                                            .disabled(isExporting || showExportFormatPicker)
+                                            .disabled(isExporting || isImporting || showExportFormatPicker || showImportURLSheet)
                                             .accessibilityLabel("Continue Scan")
                                         }
 
-                                        if onExport != nil {
+                                        if session == nil {
                                             Button(action: {
-                                                guard !isExporting else { return }
+                                                guard !isExporting, !isImporting else { return }
+                                                emitTapHaptic()
+                                                showImportURLSheet = true
+                                            }) {
+                                                Image(systemName: "link.badge.plus")
+                                                    .font(.system(.caption, design: .monospaced).bold())
+                                                    .frame(width: 36, height: 36)
+                                            }
+                                            .tint(.gray)
+                                            .buttonStyle(.glass)
+                                            .disabled(isExporting || isImporting)
+                                            .accessibilityLabel("Load URL")
+                                        }
+
+                                        if session != nil, onExport != nil {
+                                            Button(action: {
+                                                guard !isExporting, !isImporting else { return }
                                                 emitTapHaptic()
                                                 showExportFormatPicker = true
                                             }) {
@@ -312,7 +419,7 @@ struct PointCloudViewer: View {
                                             }
                                             .tint(.blue)
                                             .buttonStyle(.glassProminent)
-                                            .disabled(isExporting)
+                                            .disabled(isExporting || isImporting)
                                         }
                                     }
                                     .padding(.vertical, 2)
@@ -334,18 +441,18 @@ struct PointCloudViewer: View {
         }
         .preferredColorScheme(.dark)
         .overlay(alignment: .top) {
-            if isExporting {
+            if isExporting || isImporting {
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(exportStatusText)
+                        Text(isImporting ? importStatusText : exportStatusText)
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.white)
                             .lineLimit(1)
                         HStack(spacing: 10) {
-                            ProgressView(value: exportProgress, total: 1.0)
+                            ProgressView(value: isImporting ? importProgress : exportProgress, total: 1.0)
                                 .tint(.white)
                                 .frame(maxWidth: .infinity)
-                            Text("\(Int(exportProgress * 100))%")
+                            Text("\(Int((isImporting ? importProgress : exportProgress) * 100))%")
                                 .font(.system(.caption, design: .monospaced).bold())
                                 .foregroundStyle(.white)
                         }
@@ -354,8 +461,13 @@ struct PointCloudViewer: View {
 
                     Button("CANCEL") {
                         emitTapHaptic()
-                        exportCancellation.requestCancel()
-                        exportStatusText = "Cancelling export..."
+                        if isImporting {
+                            importCancellation.requestCancel()
+                            importStatusText = "Cancelling import..."
+                        } else {
+                            exportCancellation.requestCancel()
+                            exportStatusText = "Cancelling export..."
+                        }
                     }
                     .font(.system(.caption2, design: .monospaced).bold())
                     .buttonStyle(.glass)
@@ -367,6 +479,78 @@ struct PointCloudViewer: View {
                 .padding(.top, 64)
                 .transition(.opacity)
             }
+        }
+        .sheet(isPresented: $showImportURLSheet) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("Enter COPC URL")
+                        .font(.system(.headline, design: .monospaced))
+                        .foregroundStyle(.primary)
+
+                    TextField("https://example.com/data.copc.laz", text: $importURLText)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .keyboardType(.URL)
+                        .font(.system(.caption, design: .monospaced))
+                        .padding(10)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                    Text("HTTPS direct links are supported in v1.")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    Text("Quick Samples")
+                        .font(.system(.caption, design: .monospaced).weight(.bold))
+                        .foregroundStyle(.primary)
+                        .padding(.top, 2)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(importSampleURLs, id: \.url) { sample in
+                            Button(action: {
+                                emitTapHaptic()
+                                importURLText = sample.url
+                            }) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "link")
+                                        .font(.system(size: 11, weight: .semibold))
+                                    Text(sample.title)
+                                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                                        .lineLimit(1)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.primary)
+                        }
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .padding(16)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            emitTapHaptic()
+                            showImportURLSheet = false
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Load") {
+                            emitTapHaptic()
+                            startImportFromURL()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                    }
+                }
+            }
+            .tint(.blue)
+            .presentationDetents([.fraction(0.46), .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.thinMaterial)
         }
         .sheet(isPresented: $showShareSheet) {
             if !exportURLs.isEmpty {
@@ -400,6 +584,19 @@ struct PointCloudViewer: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .confirmationDialog(
+            "Color By",
+            isPresented: $showColorModePicker,
+            titleVisibility: .visible
+        ) {
+            ForEach(CloudColorMode.allCases, id: \.rawValue) { mode in
+                Button(selectedColorMode == mode ? "\(mode.title) ✓" : mode.title) {
+                    emitTapHaptic()
+                    selectedColorMode = mode
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
         .alert("Export Failed", isPresented: $showExportError) {
             Button("OK", role: .cancel) { }
         } message: {
@@ -409,6 +606,26 @@ struct PointCloudViewer: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text("The export was cancelled.")
+        }
+        .alert("Import Failed", isPresented: $showImportError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(importErrorText)
+        }
+        .alert("Import Cancelled", isPresented: $showImportCancelledNotice) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("The import was cancelled.")
+        }
+        .onAppear {
+            guard session == nil else { return }
+            guard engine.activePointCount == 0 else { return }
+            guard !isImporting, !showImportURLSheet else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                if session == nil && engine.activePointCount == 0 && !isImporting {
+                    showImportURLSheet = true
+                }
+            }
         }
     }
 
@@ -421,6 +638,34 @@ struct PointCloudViewer: View {
         }
         .buttonStyle(.glass)
         .disabled(true)
+    }
+
+    @ViewBuilder
+    private var colorModeMenu: some View {
+        Button(action: {
+            emitTapHaptic()
+            showColorModePicker = true
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "paintpalette")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("COLOR")
+                    .font(.system(.caption2, design: .monospaced).weight(.bold))
+                Text(colorModeSummaryText)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+        }
+        .buttonStyle(.glass)
+    }
+
+    private var colorModeSummaryText: String {
+        if selectedColorMode == .auto {
+            return hasUsableRGB ? "AUTO→RGB" : "AUTO→ELEV"
+        }
+        return effectiveColorMode.title
     }
 
     private func emitTapHaptic() {
@@ -663,6 +908,49 @@ struct PointCloudViewer: View {
         return "\(formatted)m"
     }
 
+    private var shouldShowInfoPanel: Bool {
+        session != nil || engine.activePointCount > 0 || isImporting
+    }
+
+    private var panelTitle: String {
+        if let session {
+            return session.name
+        }
+        return importedSourceLabel ?? "Remote Point Cloud"
+    }
+
+    private var panelSubtitle: String {
+        if let session {
+            return "UPDATED \(formatDate(session.updatedAt))"
+        }
+        if isImporting {
+            return "IMPORT IN PROGRESS"
+        }
+        return importedSourceURLText ?? "Remote URL"
+    }
+
+    private var panelPointCount: Int {
+        if let session {
+            return session.pointCount
+        }
+        return engine.activePointCount
+    }
+
+    private func remoteSourceName(from url: URL) -> String {
+        let raw = url.deletingPathExtension().lastPathComponent
+        if !raw.isEmpty { return raw }
+        if let host = url.host, !host.isEmpty { return host }
+        return "Remote Point Cloud"
+    }
+
+    private func remoteSourceURLDisplay(from url: URL) -> String {
+        let host = url.host ?? "remote"
+        let path = url.path
+        let combined = path.isEmpty || path == "/" ? host : "\(host)\(path)"
+        if combined.count <= 46 { return combined }
+        return "\(combined.prefix(43))..."
+    }
+
     @ViewBuilder
     private var georefStatusPill: some View {
         Button(action: {
@@ -778,9 +1066,57 @@ struct PointCloudViewer: View {
         String(format: "%.6f", value)
     }
 
+    private func startImportFromURL() {
+        guard !isExporting, !isImporting else { return }
+        let trimmed = importURLText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            importErrorText = "Please enter a valid HTTP(S) URL."
+            showImportError = true
+            return
+        }
+
+        showImportURLSheet = false
+        importCancellation = ExportCancellationFlag()
+        importProgress = 0
+        importStatusText = "Checking remote file..."
+        showImportCancelledNotice = false
+        isImporting = true
+        selectedColorMode = .auto
+
+        engine.importPointCloudFromURL(
+            url,
+            progress: { progress, message in
+                DispatchQueue.main.async {
+                    guard isImporting else { return }
+                    importProgress = min(max(progress, 0), 1)
+                    importStatusText = message
+                }
+            },
+            isCancelled: {
+                importCancellation.isCancelled
+            },
+            completion: { success, message in
+                isImporting = false
+                if success {
+                    importedSourceLabel = remoteSourceName(from: url)
+                    importedSourceURLText = remoteSourceURLDisplay(from: url)
+                    measureController.resetForNewPointCloud()
+                    recenterSignal &+= 1
+                } else if importCancellation.isCancelled || (message?.localizedCaseInsensitiveContains("cancel") == true) {
+                    showImportCancelledNotice = true
+                } else {
+                    importErrorText = message ?? "Could not import this URL."
+                    showImportError = true
+                }
+            }
+        )
+    }
+
     private func startExport(session: ScanSession, format: PointCloudEngine.ExportFormat) {
         guard let onExport else { return }
-        guard !isExporting else { return }
+        guard !isExporting, !isImporting else { return }
         exportCancellation = ExportCancellationFlag()
         exportProgress = 0
         switch format {
@@ -977,6 +1313,28 @@ final class MeasureController: ObservableObject {
 
     func setTool(_ tool: MeasureTool) {
         selectedTool = tool
+    }
+
+    func resetForNewPointCloud() {
+        snapPoint = nil
+        hasSnapPoint = false
+        activeVertices = []
+        committedPaths = []
+        sampledCloudPoints = []
+        analysisByPathID = [:]
+        selectedAnalysisPathID = nil
+        currentAnalysisCard = nil
+        projectedActiveVertices = []
+        projectedCommittedVertices = []
+        projectedActiveSegments = []
+        projectedCommittedSegments = []
+        projectedActiveSwathSegments = []
+        projectedCommittedSwathSegments = []
+        projectedSnapPoint = nil
+        overlayLabels = []
+        if selectedTool != .path {
+            selectedTool = .path
+        }
     }
 
     func addVertex() {
@@ -2061,7 +2419,11 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     let engine: PointCloudEngine
     let isRenderingPaused: Bool
     let recenterSignal: Int
+    let isRollUnlocked: Bool
+    let uprightResetSignal: Int
     let measureController: MeasureController
+    let selectedColorMode: CloudColorMode
+    let onRenderColorStatusChanged: (PointCloudRenderColorStatus) -> Void
     
     func makeUIView(context: Context) -> MTKView {
         let mtkView = MTKView()
@@ -2082,6 +2444,9 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     func updateUIView(_ uiView: MTKView, context: Context) {
         uiView.isPaused = isRenderingPaused
         context.coordinator.updateRecenterSignal(recenterSignal)
+        context.coordinator.updateRollUnlocked(isRollUnlocked)
+        context.coordinator.updateUprightResetSignal(uprightResetSignal)
+        context.coordinator.updateSelectedColorMode(selectedColorMode)
         // Setup gestures if not already done
         if uiView.gestureRecognizers?.isEmpty ?? true {
             context.coordinator.setupGestures(for: uiView)
@@ -2089,13 +2454,35 @@ struct PointCloudViewerMetal: UIViewRepresentable {
     }
     
     func makeCoordinator() -> Coordinator {
-        Coordinator(device: device, engine: engine, measureController: measureController)
+        Coordinator(
+            device: device,
+            engine: engine,
+            measureController: measureController,
+            onRenderColorStatusChanged: onRenderColorStatusChanged
+        )
     }
     
     class Coordinator: NSObject, MTKViewDelegate, UIGestureRecognizerDelegate {
         private struct VoxelMirror {
             var positionAndConfidence: SIMD4<Float>
             var colorAndSampleCount: SIMD4<Float>
+        }
+
+        private struct RenderColorUniforms {
+            var mode: UInt32
+            var hasUsableRGB: UInt32
+            var minElevation: Float
+            var maxElevation: Float
+            var minIntensity: Float
+            var maxIntensity: Float
+        }
+
+        private struct RenderColorStats {
+            var minElevation: Float = -1
+            var maxElevation: Float = 1
+            var minIntensity: Float = 0
+            var maxIntensity: Float = 1
+            var hasUsableRGB: Bool = true
         }
 
         private struct CameraPose {
@@ -2116,10 +2503,16 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         private let device: MTLDevice
         private let engine: PointCloudEngine
         private let measureController: MeasureController
+        private let onRenderColorStatusChanged: (PointCloudRenderColorStatus) -> Void
         private let commandQueue: MTLCommandQueue
         private var pipelineState: MTLRenderPipelineState!
         private var depthStencilState: MTLDepthStencilState!
         private let cameraFOVDegrees: Float = 60.0
+        private var selectedColorMode: CloudColorMode = .auto
+        private var renderColorStats = RenderColorStats()
+        private var lastColorStatsPointCount: Int = -1
+        private var lastColorStatsRefreshTime: TimeInterval = 0
+        private var lastRenderColorStatus: PointCloudRenderColorStatus?
         
         // Orbit camera state
         private var cameraDistance: Float = 2.0
@@ -2130,6 +2523,9 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         private var shouldAutoFit = true
         private var pendingManualRecenter = false
         private var lastRecenterSignal = 0
+        private var rollUnlocked = false
+        private var pendingUprightReset = false
+        private var lastUprightResetSignal = 0
         private var cameraAnimation: CameraAnimation?
 
         private var sampledPoints: [MeasureController.CloudSamplePoint] = []
@@ -2139,10 +2535,16 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         // Gesture tracking
         // (handled by UIGestureRecognizers)
         
-        init(device: MTLDevice, engine: PointCloudEngine, measureController: MeasureController) {
+        init(
+            device: MTLDevice,
+            engine: PointCloudEngine,
+            measureController: MeasureController,
+            onRenderColorStatusChanged: @escaping (PointCloudRenderColorStatus) -> Void
+        ) {
             self.device = device
             self.engine = engine
             self.measureController = measureController
+            self.onRenderColorStatusChanged = onRenderColorStatusChanged
             self.commandQueue = device.makeCommandQueue()!
             
             super.init()
@@ -2180,6 +2582,24 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             lastRecenterSignal = signal
             pendingManualRecenter = true
         }
+
+        func updateRollUnlocked(_ unlocked: Bool) {
+            guard rollUnlocked != unlocked else { return }
+            rollUnlocked = unlocked
+            if !unlocked {
+                pendingUprightReset = true
+            }
+        }
+
+        func updateUprightResetSignal(_ signal: Int) {
+            guard signal != lastUprightResetSignal else { return }
+            lastUprightResetSignal = signal
+            pendingUprightReset = true
+        }
+
+        func updateSelectedColorMode(_ mode: CloudColorMode) {
+            selectedColorMode = mode
+        }
         
         func draw(in view: MTKView) {
             guard let renderPassDescriptor = view.currentRenderPassDescriptor,
@@ -2197,12 +2617,44 @@ struct PointCloudViewerMetal: UIViewRepresentable {
                 shouldAutoFit = !recenterCameraToPointCloud(viewportSize: view.bounds.size, animated: true)
             }
 
+            if pendingUprightReset {
+                pendingUprightReset = false
+                if abs(cameraRoll) > 0.0005 {
+                    startCameraAnimation(
+                        to: CameraPose(
+                            target: orbitTarget,
+                            distance: cameraDistance,
+                            pitch: cameraPitch,
+                            yaw: cameraYaw,
+                            roll: 0
+                        ),
+                        duration: 0.18
+                    )
+                } else {
+                    cameraRoll = 0
+                }
+            }
+
             updateCameraAnimationIfNeeded()
+            refreshRenderColorStatsIfNeeded()
+            let effectiveColorMode = resolvedColorMode()
+            let status = PointCloudRenderColorStatus(
+                hasUsableRGB: renderColorStats.hasUsableRGB,
+                effectiveMode: effectiveColorMode
+            )
+            if status != lastRenderColorStatus {
+                lastRenderColorStatus = status
+                DispatchQueue.main.async { [status, onRenderColorStatusChanged] in
+                    onRenderColorStatusChanged(status)
+                }
+            }
             
             // Build orbit camera matrices
             let viewMatrix = makeOrbitViewMatrix()
             let aspect = max(Float(view.bounds.width / max(1, view.bounds.height)), 0.2)
-            let projectionMatrix = makeProjectionMatrix(aspect: aspect, fov: cameraFOVDegrees, near: 0.01, far: 100.0)
+            let nearPlane = max(0.01, min(10.0, cameraDistance * 0.0008))
+            let farPlane = max(300.0, min(2_000_000.0, cameraDistance * 200.0))
+            let projectionMatrix = makeProjectionMatrix(aspect: aspect, fov: cameraFOVDegrees, near: nearPlane, far: farPlane)
 
             if measureController.isEnabled {
                 refreshPointSamplesIfNeeded()
@@ -2229,12 +2681,21 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             }
             
             var vpMatrix = projectionMatrix * viewMatrix
+            var colorUniforms = RenderColorUniforms(
+                mode: UInt32(effectiveColorMode.rawValue),
+                hasUsableRGB: renderColorStats.hasUsableRGB ? 1 : 0,
+                minElevation: renderColorStats.minElevation,
+                maxElevation: renderColorStats.maxElevation,
+                minIntensity: renderColorStats.minIntensity,
+                maxIntensity: renderColorStats.maxIntensity
+            )
             
             // Render point cloud
             encoder.setRenderPipelineState(pipelineState)
             encoder.setDepthStencilState(depthStencilState)
             encoder.setVertexBuffer(engine.voxelBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&vpMatrix, length: MemoryLayout<simd_float4x4>.stride, index: 1)
+            encoder.setVertexBytes(&colorUniforms, length: MemoryLayout<RenderColorUniforms>.stride, index: 2)
             encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: engine.maxVoxels)
             
             encoder.endEncoding()
@@ -2247,25 +2708,9 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         // MARK: - Camera Math
         
         private func makeOrbitViewMatrix() -> simd_float4x4 {
-            let dir = SIMD3<Float>(
-                cos(cameraPitch) * sin(cameraYaw),
-                sin(cameraPitch),
-                cos(cameraPitch) * cos(cameraYaw)
-            )
-            let eye = orbitTarget - dir * cameraDistance
-            let forward = simd_normalize(orbitTarget - eye)
-            var upReference = SIMD3<Float>(0, 1, 0)
-            if abs(simd_dot(forward, upReference)) > 0.98 {
-                upReference = SIMD3<Float>(0, 0, 1)
-            }
-            let right = simd_normalize(simd_cross(forward, upReference))
-            let up = simd_normalize(simd_cross(right, forward))
-
-            let cosRoll = cos(cameraRoll)
-            let sinRoll = sin(cameraRoll)
-            let rolledUp = simd_normalize(up * cosRoll - right * sinRoll)
-
-            return lookAt(eye: eye, center: orbitTarget, up: rolledUp)
+            let eye = cameraPosition()
+            let basis = cameraBasis()
+            return lookAt(eye: eye, center: orbitTarget, up: basis.up)
         }
 
         private func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
@@ -2318,7 +2763,7 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             let framingPadding: Float = 1.18
             let targetDistance = max(
                 0.12,
-                min(30.0, (radius / tan(limitingHalfFOV)) * framingPadding)
+                min(50_000.0, (radius / tan(limitingHalfFOV)) * framingPadding)
             )
 
             let targetPose = CameraPose(
@@ -2468,6 +2913,94 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             lastSampleRefreshTime = now
         }
 
+        private func resolvedColorMode() -> CloudColorMode {
+            if selectedColorMode == .auto {
+                return renderColorStats.hasUsableRGB ? .rgb : .elevation
+            }
+            return selectedColorMode
+        }
+
+        private func refreshRenderColorStatsIfNeeded() {
+            let now = CACurrentMediaTime()
+            let activeCount = engine.activePointCount
+            let shouldRefreshByCount = abs(activeCount - lastColorStatsPointCount) > 3_000
+            let shouldRefreshByTime = (now - lastColorStatsRefreshTime) > 0.30
+            guard shouldRefreshByCount || shouldRefreshByTime || lastColorStatsPointCount < 0 else { return }
+
+            guard activeCount > 0 else {
+                renderColorStats = RenderColorStats()
+                lastColorStatsPointCount = 0
+                lastColorStatsRefreshTime = now
+                return
+            }
+
+            let voxels = engine.voxelBuffer.contents().assumingMemoryBound(to: VoxelMirror.self)
+            let sampleStride = max(1, engine.maxVoxels / 120_000)
+
+            var hasAny = false
+            var minElevation = Float.greatestFiniteMagnitude
+            var maxElevation = -Float.greatestFiniteMagnitude
+            var minIntensity = Float.greatestFiniteMagnitude
+            var maxIntensity = -Float.greatestFiniteMagnitude
+
+            var sampleCount = 0
+            var brightWhiteCount = 0
+            var luminanceMean: Float = 0
+            var luminanceM2: Float = 0
+
+            for idx in stride(from: 0, to: engine.maxVoxels, by: sampleStride) {
+                let voxel = voxels[idx]
+                if voxel.colorAndSampleCount.w <= 0 { continue }
+
+                hasAny = true
+                sampleCount += 1
+
+                let y = voxel.positionAndConfidence.y
+                minElevation = min(minElevation, y)
+                maxElevation = max(maxElevation, y)
+
+                let intensity = max(0, min(1, voxel.positionAndConfidence.w))
+                minIntensity = min(minIntensity, intensity)
+                maxIntensity = max(maxIntensity, intensity)
+
+                let r = max(0, min(1, voxel.colorAndSampleCount.x))
+                let g = max(0, min(1, voxel.colorAndSampleCount.y))
+                let b = max(0, min(1, voxel.colorAndSampleCount.z))
+                if abs(r - 1) + abs(g - 1) + abs(b - 1) < 0.03 {
+                    brightWhiteCount += 1
+                }
+
+                let luminance = (0.2126 * r) + (0.7152 * g) + (0.0722 * b)
+                let delta = luminance - luminanceMean
+                luminanceMean += delta / Float(sampleCount)
+                let delta2 = luminance - luminanceMean
+                luminanceM2 += delta * delta2
+            }
+
+            guard hasAny else {
+                renderColorStats = RenderColorStats()
+                lastColorStatsPointCount = activeCount
+                lastColorStatsRefreshTime = now
+                return
+            }
+
+            let elevationSpan = max(0.001, maxElevation - minElevation)
+            let intensitySpan = max(0.001, maxIntensity - minIntensity)
+            let whiteFraction = sampleCount > 0 ? Float(brightWhiteCount) / Float(sampleCount) : 1.0
+            let luminanceVariance = sampleCount > 1 ? luminanceM2 / Float(sampleCount - 1) : 0
+            let hasUsableRGB = (whiteFraction < 0.985) && (luminanceVariance > 0.00005)
+
+            renderColorStats = RenderColorStats(
+                minElevation: minElevation,
+                maxElevation: minElevation + elevationSpan,
+                minIntensity: minIntensity,
+                maxIntensity: minIntensity + intensitySpan,
+                hasUsableRGB: hasUsableRGB
+            )
+            lastColorStatsPointCount = activeCount
+            lastColorStatsRefreshTime = now
+        }
+
         private func nearestPointNearCenter(
             viewMatrix: simd_float4x4,
             projectionMatrix: simd_float4x4,
@@ -2534,13 +3067,11 @@ struct PointCloudViewerMetal: UIViewRepresentable {
             let translation = gesture.translation(in: gesture.view)
             
             if gesture.numberOfTouches == 1 {
-                // Single finger - pan target in camera plane
+                // Single finger - pan in current screen-space basis (respects roll/orientation).
                 let panSpeed = 0.0014 * cameraDistance
-                let forward = simd_normalize(orbitTarget - cameraPosition())
-                let right = simd_normalize(simd_cross(forward, SIMD3<Float>(0, 1, 0)))
-                let up = simd_normalize(simd_cross(right, forward))
-                orbitTarget -= right * Float(translation.x) * panSpeed
-                orbitTarget += up * Float(translation.y) * panSpeed
+                let basis = cameraBasis()
+                orbitTarget -= basis.right * Float(translation.x) * panSpeed
+                orbitTarget += basis.up * Float(translation.y) * panSpeed
             } else if gesture.numberOfTouches == 2 {
                 // Two fingers - orbit around current crosshair snap (if available) at gesture start
                 if gesture.state == .began, let snap = measureController.currentSnapWorldPoint() {
@@ -2556,12 +3087,14 @@ struct PointCloudViewerMetal: UIViewRepresentable {
         
         @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
             cancelCameraAnimation()
-            cameraDistance /= Float(gesture.scale)
-            cameraDistance = max(0.12, min(30.0, cameraDistance))  // Wider zoom range for detailed picking
+            let normalizedDelta = Float(log2(max(0.01, Double(gesture.scale))))
+            cameraDistance *= exp2(-normalizedDelta * 1.25)
+            cameraDistance = max(0.12, min(100_000.0, cameraDistance))
             gesture.scale = 1.0
         }
 
         @objc private func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+            guard rollUnlocked else { return }
             cancelCameraAnimation()
             // Incremental twist delta; reset each frame for stable, low-latency roll control.
             let delta = Float(gesture.rotation)
@@ -2587,6 +3120,23 @@ struct PointCloudViewerMetal: UIViewRepresentable {
                 cos(cameraPitch) * cos(cameraYaw)
             )
             return orbitTarget - dir * cameraDistance
+        }
+
+        private func cameraBasis() -> (forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>) {
+            let eye = cameraPosition()
+            let forward = simd_normalize(orbitTarget - eye)
+            var upReference = SIMD3<Float>(0, 1, 0)
+            if abs(simd_dot(forward, upReference)) > 0.98 {
+                upReference = SIMD3<Float>(0, 0, 1)
+            }
+            let baseRight = simd_normalize(simd_cross(forward, upReference))
+            let baseUp = simd_normalize(simd_cross(baseRight, forward))
+
+            let cosRoll = cos(cameraRoll)
+            let sinRoll = sin(cameraRoll)
+            let rolledRight = simd_normalize(baseRight * cosRoll + baseUp * sinRoll)
+            let rolledUp = simd_normalize(baseUp * cosRoll - baseRight * sinRoll)
+            return (forward, rolledRight, rolledUp)
         }
     }
 }

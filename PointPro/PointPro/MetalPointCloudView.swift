@@ -35,6 +35,15 @@ struct MetalPointCloudView: UIViewRepresentable {
     }
     
     class Coordinator: NSObject, MTKViewDelegate {
+        private struct RenderColorUniforms {
+            var mode: UInt32
+            var hasUsableRGB: UInt32
+            var minElevation: Float
+            var maxElevation: Float
+            var minIntensity: Float
+            var maxIntensity: Float
+        }
+
         private let device: MTLDevice
         private let engine: PointCloudEngine
         private let session: ARSession
@@ -117,6 +126,15 @@ struct MetalPointCloudView: UIViewRepresentable {
             
             encoder.setVertexBuffer(engine.voxelBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&vpMatrix, length: MemoryLayout<simd_float4x4>.stride, index: 1)
+            var colorUniforms = RenderColorUniforms(
+                mode: 1,          // RGB
+                hasUsableRGB: 1,  // AR capture path has camera RGB
+                minElevation: -1,
+                maxElevation: 1,
+                minIntensity: 0,
+                maxIntensity: 1
+            )
+            encoder.setVertexBytes(&colorUniforms, length: MemoryLayout<RenderColorUniforms>.stride, index: 2)
             
             encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: engine.maxVoxels)
             
