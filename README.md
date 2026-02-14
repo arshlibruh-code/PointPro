@@ -2,7 +2,7 @@
 
 iOS LiDAR app for on-device capture, point-cloud viewing, measurement, and PLY export.
 
-![PointPro Screenshot](./screenshot.png)
+![PointPro Screenshot](./assets/screenshot.png)
 
 ## Current Capabilities
 
@@ -19,12 +19,9 @@ iOS LiDAR app for on-device capture, point-cloud viewing, measurement, and PLY e
 ## Project Structure
 
 ```text
-PointPro/
-  PointPro/              # App source
-  PointPro.xcodeproj/
-  PointProTests/
-  PointProUITests/
-docs/
+PointPro/           # App + Xcode project, tests
+docs/               # PRD.md, CHANGELOG_AND_SPECS.md
+assets/             # Screenshot and app icon assets
 ```
 
 ## Requirements
